@@ -70,34 +70,36 @@ If you know Rig, four ideas cover everything in this repo.
 Authority enters at the top and can only shrink on the way down. Every box holds its own key. Every `read_incident` call, from any level, goes to the MCP server at the bottom, which verifies it with nothing but the root public key.
 
 ```text
-  CONTROL PLANE (issuer)                     holds the ROOT private key
+  CONTROL PLANE (issuer)                  holds the ROOT private key
   mints one warrant for the orchestrator
       │
-      │  warrant: scale_cluster  cluster=staging-*  replicas<=10
-      │           read_incident  incident_id=INC-*
-      │           delegate_*     incident_id=INC-*          ttl 10 min
+      │  warrant: scale_cluster      cluster=staging-*  replicas<=10
+      │           read_incident      incident_id=INC-*
+      │           delegate_incident  incident_id=INC-*
+      │           delegate_subtask   incident_id=INC-*    ttl 10 min
       ▼
-  ORCHESTRATOR AGENT (Rig)                   own key · chain depth 1
+  ORCHESTRATOR AGENT (Rig)                own key · chain depth 1
       │
-      ├──── delegate_incident(INC-42) ─────────────────┐   same turn,
-      │                                                │   in parallel
-      │  warrant: read_incident  incident_id=INC-42    │
-      │           delegate_subtask                      │
-      │           ttl 5 min · may delegate once more    │
-      ▼                                                ▼
-  WORKER AGENT A                                  WORKER AGENT B
-  own key · chain depth 2                         own key · chain depth 2
-  reads INC-42 only                               reads INC-43 only
+      │  delegate_incident(INC-42) and delegate_incident(INC-43)
+      │  in the same turn, run in parallel
+      ├───────────────────────────────────────┐
+      ▼                                       ▼
+  WORKER AGENT A                          WORKER AGENT B
+  own key · chain depth 2                 own key · chain depth 2
+  warrant: read_incident  INC-42 only     warrant: read_incident  INC-43 only
+           delegate_subtask                        delegate_subtask
+           ttl 5 min · may delegate once           ttl 5 min · may delegate once
       │
       │  delegate_subtask(INC-42)
-      │  warrant: read_incident  incident_id=INC-42   ttl 2 min · terminal
       ▼
   READER AGENT
-  own key · chain depth 3 · cannot delegate
+  own key · chain depth 3 · terminal, cannot delegate
+  warrant: read_incident  INC-42 only     ttl 2 min
       │
-      │  read_incident(INC-42)  +  chain  +  signature over these arguments   (in _meta.tenuo)
+      │  read_incident(INC-42)
+      │  _meta.tenuo = chain + signature over these exact arguments
       ▼
-  INCIDENT MCP SERVER (separate process)     holds only the ROOT PUBLIC key
+  INCIDENT MCP SERVER (separate process)  holds only the ROOT PUBLIC key
   verify chain → verify signature → check constraints → run the handler
 ```
 
