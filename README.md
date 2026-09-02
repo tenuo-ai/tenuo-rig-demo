@@ -5,13 +5,13 @@ A [Rig](https://rig.rs) agent whose tools are enforced by [Tenuo](https://tenuo.
 ## Run it
 
 ```bash
-cargo run --bin demo
+cargo build --bins && cargo run --bin demo
 ```
 
-No API key needed. Scripted mode drives the tools directly so every allow, deny, and delegation outcome is deterministic. To also run a real Rig agent loop over the same tools:
+Both binaries are needed: `demo` spawns `incident-mcp-server` as a child process for the MCP hop. No API key needed. Scripted mode drives the tools directly so every allow, deny, and delegation outcome is deterministic. To also run a real Rig agent loop over the same tools:
 
 ```bash
-OPENAI_API_KEY=... cargo run --features agent --bin demo
+cargo build --bins && OPENAI_API_KEY=... cargo run --features agent --bin demo
 ```
 
 ## What it shows
