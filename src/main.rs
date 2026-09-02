@@ -147,10 +147,11 @@ async fn main() -> anyhow::Result<()> {
 
     #[cfg(feature = "agent")]
     {
+        use rig::prelude::*;
         println!("\n== 7. real Rig agent over the same tools ==");
         let api_key = std::env::var("OPENAI_API_KEY")
             .map_err(|_| anyhow::anyhow!("OPENAI_API_KEY is required for --features agent"))?;
-        let openai = rig::providers::openai::Client::new(api_key);
+        let openai = rig::providers::openai::Client::new(api_key)?;
         let agent = openai
             .agent("gpt-4o")
             .preamble("You operate infrastructure. Use tools; report what happened.")
