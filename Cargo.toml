@@ -1,0 +1,30 @@
+[package]
+name = "tenuo-rig-demo"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Rig agent whose tools are enforced by Tenuo warrants: constrained arguments, delegation that only narrows, and an MCP hop verified on the server."
+
+[dependencies]
+# Tenuo SDK from main until 0.2.4 is published.
+tenuo = { git = "https://github.com/tenuo-ai/tenuo", branch = "main", features = ["sdk", "mcp-transport"] }
+rig = "0.42"
+rmcp = { version = "3.2", features = ["client", "server", "transport-child-process", "transport-io", "macros"] }
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+schemars = "1"
+anyhow = "1"
+hex = "0.4"
+
+[features]
+# Real Rig agent loop. Needs OPENAI_API_KEY at run time.
+agent = []
+
+[[bin]]
+name = "demo"
+path = "src/main.rs"
+
+[[bin]]
+name = "incident-mcp-server"
+path = "src/bin/incident_mcp_server.rs"
