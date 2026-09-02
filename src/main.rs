@@ -93,6 +93,12 @@ async fn main() -> anyhow::Result<()> {
         .parent()
         .ok_or_else(|| anyhow::anyhow!("no exe dir"))?
         .join("incident-mcp-server");
+    if !server_bin.exists() {
+        anyhow::bail!(
+            "{} not found. Run `cargo build --bins` first; the demo spawns the MCP server as a child process.",
+            server_bin.display()
+        );
+    }
     let mut cmd = tokio::process::Command::new(server_bin);
     cmd.env("TENUO_ROOT_PUBLIC_KEY", hex::encode(root.public_key().to_bytes()));
     let client = Arc::new(().serve(TokioChildProcess::new(cmd)?).await?);
@@ -142,7 +148,9 @@ async fn main() -> anyhow::Result<()> {
     #[cfg(feature = "agent")]
     {
         println!("\n== 7. real Rig agent over the same tools ==");
-        let openai = rig::providers::openai::Client::from_env();
+        let api_key = std::env::var("OPENAI_API_KEY")
+            .map_err(|_| anyhow::anyhow!("OPENAI_API_KEY is required for --features agent"))?;
+        let openai = rig::providers::openai::Client::new(api_key);
         let agent = openai
             .agent("gpt-4o")
             .preamble("You operate infrastructure. Use tools; report what happened.")
