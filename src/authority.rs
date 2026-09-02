@@ -1,8 +1,8 @@
 //! What a run carries into every tool call, and the one helper every tool uses.
 //!
-//! Rig clones `ToolContext` into each tool invocation. We put a `RunAuthority`
-//! in it once per run; tools pull it back out by type. Nothing here is
-//! Rig-specific beyond `ToolContext::insert` / `require` / `insert_result`.
+//! Rig clones `ToolContext` into each tool invocation. A `RunAuthority` goes in
+//! once per run; tools pull it back out by type. Nothing here is Rig-specific
+//! beyond `ToolContext::insert` / `get` / `insert_result`.
 
 use std::fmt;
 use std::sync::Arc;
@@ -16,11 +16,11 @@ use tenuo::sdk::prelude::*;
 pub struct RunAuthority {
     pub guard: Arc<Guard>,
     pub authority: Arc<PresentedAuthority>,
-    pub run_id: String,
+    pub agent: &'static str,
 }
 
 impl RunAuthority {
-    /// A fresh `ToolContext` carrying this authority.
+    /// A fresh `ToolContext` carrying this authority and nothing else.
     pub fn context(&self) -> ToolContext {
         let mut ctx = ToolContext::new();
         ctx.insert(self.clone());
@@ -28,7 +28,8 @@ impl RunAuthority {
     }
 }
 
-/// Error a guarded tool returns. Denials carry only the sanitized code and message.
+/// Error a guarded tool returns. Denials carry only the sanitized code and message,
+/// which is what the model sees as the tool result.
 #[derive(Debug)]
 pub enum ToolError {
     NoAuthority,
@@ -53,36 +54,38 @@ impl std::error::Error for ToolError {}
 /// Run `op` only if the warrant in `ctx` allows `capability` with `args`.
 ///
 /// On allow, the decision record goes into the context's host-only result slot,
-/// so the agent host can log or forward it without the model ever seeing it.
+/// so the host can log or forward it without the model ever seeing it.
 pub fn guarded<A, T>(
     ctx: &mut ToolContext,
     capability: &'static str,
     args: &A,
-    op: impl FnOnce() -> Result<T, ToolError>,
+    op: impl FnOnce(&AuthorizedCall<'_>) -> Result<T, ToolError>,
 ) -> Result<T, ToolError>
 where
     A: Serialize,
 {
-    let run = ctx
-        .get::<RunAuthority>()
-        .cloned()
-        .ok_or(ToolError::NoAuthority)?;
-
+    let run = ctx.get::<RunAuthority>().cloned().ok_or(ToolError::NoAuthority)?;
     let value = serde_json::to_value(args).map_err(|e| ToolError::Arguments(e.to_string()))?;
     let call = Call::try_from_json(capability, &value)
         .map_err(|e| ToolError::Arguments(format!("{e:?}")))?;
 
-    let guarded = run
-        .guard
-        .guard(&run.authority, &call, |_authorized| op())
-        .map_err(|e| match e {
-            GuardError::Denied(d) => ToolError::Denied {
-                code: d.code().to_string(),
-                message: d.message().to_string(),
-            },
-            GuardError::Operation(e) => e,
-        })?;
+    let summary = value.to_string();
+    let result = run.guard.guard(&run.authority, &call, op);
+    match &result {
+        Ok(_) => println!("      [tenuo] allow  {:<12} {capability} {summary}", run.agent),
+        Err(GuardError::Denied(d)) => {
+            println!("      [tenuo] deny   {:<12} {capability} {summary}  ({})", run.agent, d.code())
+        }
+        Err(GuardError::Operation(_)) => {}
+    }
 
+    let guarded = result.map_err(|e| match e {
+        GuardError::Denied(d) => ToolError::Denied {
+            code: d.code().to_string(),
+            message: d.message().to_string(),
+        },
+        GuardError::Operation(e) => e,
+    })?;
     ctx.insert_result(guarded.decision.metadata.clone());
     Ok(guarded.into_inner())
 }

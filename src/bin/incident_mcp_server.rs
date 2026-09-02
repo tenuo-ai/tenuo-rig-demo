@@ -39,11 +39,10 @@ impl IncidentServer {
         Parameters(args): Parameters<IncidentArgs>,
     ) -> Result<String, McpError> {
         // 1. Pull the Tenuo envelope out of _meta. Missing means deny.
-        let tenuo = ctx
-            .meta
-            .get("tenuo")
-            .cloned()
-            .ok_or_else(|| McpError::invalid_params("missing _meta.tenuo", None))?;
+        let tenuo = ctx.meta.get("tenuo").cloned().ok_or_else(|| {
+            eprintln!("      [mcp-server] refused  read_incident {}: no _meta.tenuo", args.incident_id);
+            McpError::invalid_params("missing _meta.tenuo", None)
+        })?;
         let received = decode_meta(&tenuo)
             .map_err(|e| McpError::invalid_params(format!("bad _meta.tenuo: {e:?}"), None))?;
         let received = received
@@ -57,9 +56,12 @@ impl IncidentServer {
             .map_err(|e| McpError::invalid_params(format!("{e:?}"), None))?;
 
         // 3. Verify chain + PoP + constraints, then run the handler once.
+        let holder = received.leaf().authorized_holder().fingerprint();
+        let depth = received.chain().len();
         let out = self
             .guard
             .guard_received(&received, &call, |_| {
+                eprintln!("      [mcp-server] verified read_incident {} for holder {holder} (chain depth {depth})", args.incident_id);
                 Ok::<_, std::convert::Infallible>(format!(
                     "{}: severity=high, status=open, owner=secops (served by MCP)",
                     args.incident_id
@@ -67,6 +69,7 @@ impl IncidentServer {
             })
             .map_err(|e| match e {
                 GuardError::Denied(d) => {
+                    eprintln!("      [mcp-server] denied   read_incident {} for holder {holder}: {}", args.incident_id, d.code());
                     McpError::invalid_params(format!("denied ({}): {}", d.code(), d.message()), None)
                 }
                 GuardError::Operation(never) => match never {},

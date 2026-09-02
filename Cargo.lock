@@ -6621,6 +6621,7 @@ name = "tenuo-rig-demo"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "futures",
  "hex",
  "rig",
  "rmcp",
