@@ -9,7 +9,7 @@
 use std::time::Duration;
 
 use tenuo::sdk::prelude::*;
-use tenuo::{constraints, Range};
+use tenuo::{constraints, Range, Wildcard};
 
 pub struct ControlPlane {
     root: SigningKey,
@@ -43,8 +43,13 @@ impl ControlPlane {
                 constraints! { "incident_id" => Pattern::new("INC-*")? },
             )
             .capability("delegate_incident", constraints! { "incident_id" => Pattern::new("INC-*")? })
+            .capability(
+                "delegate_subtask",
+                constraints! { "incident_id" => Pattern::new("INC-*")?, "scope" => Wildcard::new() },
+            )
             .holder(holder.clone())
             .ttl(Duration::from_secs(600))
+            .max_depth(3)
             .build(&self.root)?)
     }
 }

@@ -16,6 +16,8 @@ use rig::streaming::{RawStreamingChoice, RawStreamingToolCall, StreamFinal, Stre
 #[derive(Clone)]
 pub enum Step {
     Call { tool: &'static str, args: serde_json::Value },
+    /// Several tool calls in one turn. Rig runs them concurrently under `tool_concurrency(n)`.
+    Calls(Vec<(&'static str, serde_json::Value)>),
     Say(&'static str),
 }
 
@@ -38,37 +40,38 @@ impl ScriptedModel {
     }
 }
 
+fn tool_call(tool: &'static str, args: serde_json::Value, i: usize) -> AssistantContent {
+    AssistantContent::ToolCall(ToolCall::from_wire(
+        format!("{tool}-call-{i}"),
+        ToolFunction::new(tool.to_owned(), args),
+    ))
+}
+
+fn stream_call(tool: &'static str, args: serde_json::Value, i: usize) -> RawStreamingChoice {
+    RawStreamingChoice::ToolCall(RawStreamingToolCall::new(format!("{tool}-call-{i}"), tool.to_owned(), args))
+}
+
 fn usage(total_tokens: u64) -> Usage {
     Usage { total_tokens, ..Usage::new() }
 }
 
 impl CompletionModel for ScriptedModel {
     async fn completion(&self, _request: CompletionRequest) -> Result<CompletionResponse, CompletionError> {
-        let choice = match self.next() {
-            Step::Call { tool, args } => AssistantContent::ToolCall(ToolCall::from_wire(
-                format!("{tool}-call"),
-                ToolFunction::new(tool.to_owned(), args),
-            )),
-            Step::Say(text) => AssistantContent::text(text),
+        let choices = match self.next() {
+            Step::Call { tool, args } => vec![tool_call(tool, args, 0)],
+            Step::Calls(calls) => calls.into_iter().enumerate().map(|(i, (t, a))| tool_call(t, a, i)).collect(),
+            Step::Say(text) => vec![AssistantContent::text(text)],
         };
-        Ok(CompletionResponse::new(vec![choice], usage(1), self.name))
+        Ok(CompletionResponse::new(choices, usage(1), self.name))
     }
 
     async fn stream(&self, _request: CompletionRequest) -> Result<StreamingCompletionResponse, CompletionError> {
-        let choice = match self.next() {
-            Step::Call { tool, args } => RawStreamingChoice::ToolCall(RawStreamingToolCall::new(
-                format!("{tool}-call"),
-                tool.to_owned(),
-                args,
-            )),
-            Step::Say(text) => RawStreamingChoice::Message(text.to_owned()),
+        let mut items: Vec<Result<RawStreamingChoice, CompletionError>> = match self.next() {
+            Step::Call { tool, args } => vec![Ok(stream_call(tool, args, 0))],
+            Step::Calls(calls) => calls.into_iter().enumerate().map(|(i, (t, a))| Ok(stream_call(t, a, i))).collect(),
+            Step::Say(text) => vec![Ok(RawStreamingChoice::Message(text.to_owned()))],
         };
-        Ok(StreamingCompletionResponse::stream(
-            self.name,
-            Box::pin(stream::iter([
-                Ok(choice),
-                Ok(RawStreamingChoice::FinalResponse(StreamFinal::new(self.name, usage(1)))),
-            ])),
-        ))
+        items.push(Ok(RawStreamingChoice::FinalResponse(StreamFinal::new(self.name, usage(1)))));
+        Ok(StreamingCompletionResponse::stream(self.name, Box::pin(stream::iter(items))))
     }
 }

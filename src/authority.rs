@@ -16,7 +16,7 @@ use tenuo::sdk::prelude::*;
 pub struct RunAuthority {
     pub guard: Arc<Guard>,
     pub authority: Arc<PresentedAuthority>,
-    pub agent: &'static str,
+    pub agent: String,
 }
 
 impl RunAuthority {
@@ -72,11 +72,11 @@ where
     let summary = value.to_string();
     let result = run.guard.guard(&run.authority, &call, op);
     match &result {
-        Ok(_) => println!("      [tenuo] allow  {:<12} {capability} {summary}", run.agent),
+        Ok(_) => println!("      [tenuo] allow  {:<14} {capability} {summary}", run.agent),
         Err(GuardError::Denied(d)) => {
-            println!("      [tenuo] deny   {:<12} {capability} {summary}  ({})", run.agent, d.code())
+            println!("      [tenuo] deny   {:<14} {capability} {summary}  ({})", run.agent, d.code())
         }
-        Err(GuardError::Operation(_)) => {}
+        Err(GuardError::Operation(e)) => println!("      [tenuo] error  {:<14} {capability}: {e}", run.agent),
     }
 
     let guarded = result.map_err(|e| match e {

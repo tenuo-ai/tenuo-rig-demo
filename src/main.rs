@@ -24,7 +24,7 @@ use tenuo::sdk::transport::mcp_meta::encode_meta;
 use tenuo::{args, constraints, Exact};
 
 use authority::RunAuthority;
-use tools::{DelegateIncident, RemoteReadIncident, ScaleCluster};
+use tools::{DelegateIncident, DelegateSubtask, RemoteReadIncident, ScaleCluster, WorkerFactory};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -42,7 +42,7 @@ async fn main() -> anyhow::Result<()> {
         .signer(orchestrator_key)
         .revocation(RevocationMode::TtlOnly { max_lifetime: Duration::from_secs(3600) })
         .build()?;
-    let run = RunAuthority { guard: Arc::new(guard), authority: Arc::new(authority), agent: "orchestrator" };
+    let run = RunAuthority { guard: Arc::new(guard), authority: Arc::new(authority), agent: "orchestrator".into() };
 
     // ---- MCP server: separate process, configured with the root public key only --
     let server_bin = std::env::current_exe()?
@@ -57,14 +57,16 @@ async fn main() -> anyhow::Result<()> {
     let mcp = Arc::new(().serve(TokioChildProcess::new(cmd)?).await?);
 
     // ---- Agents ---------------------------------------------------------------
-    let worker = build_worker(mcp.clone());
-    let orchestrator = build_orchestrator(worker);
+    let reader_factory = build_reader_factory(mcp.clone());
+    let worker_factory = build_worker_factory(mcp.clone(), reader_factory);
+    let orchestrator = build_orchestrator(worker_factory);
 
     println!("== on-call orchestrator ==");
-    println!("   prompt: scale staging-web to 3, then production-web to 20, then investigate INC-42\n");
+    println!("   prompt: scale staging-web to 3, then production-web to 20, then investigate INC-42 and INC-43\n");
     let answer = orchestrator
-        .prompt("Scale staging-web to 3 replicas, then scale production-web to 20, then investigate INC-42 and summarize.")
+        .prompt("Scale staging-web to 3 replicas, then scale production-web to 20, then investigate INC-42 and INC-43 in parallel and summarize.")
         .tool_context(run.context())
+        .tool_concurrency(2)
         .max_turns(10)
         .await?;
     println!("\n   orchestrator: {answer}");
@@ -103,33 +105,67 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
+type Mcp = Arc<rmcp::service::RunningService<rmcp::service::RoleClient, ()>>;
+
 #[cfg(not(feature = "agent"))]
-fn build_worker(mcp: Arc<rmcp::service::RunningService<rmcp::service::RoleClient, ()>>) -> Agent {
+fn build_reader_factory(mcp: Mcp) -> WorkerFactory {
     use models::{ScriptedModel, Step};
-    let model = ScriptedModel::new("worker", vec![
-        Step::Call { tool: "read_incident", args: serde_json::json!({ "incident_id": "INC-42" }) },
-        Step::Call { tool: "read_incident", args: serde_json::json!({ "incident_id": "INC-99" }) },
-        Step::Say("INC-42 is open, severity high, owned by secops. I could not read INC-99; it is outside my authority."),
-    ]);
-    AgentBuilder::new(model)
-        .preamble("You investigate one incident. Use read_incident. Report what you found and what you could not do.")
-        .tool(RemoteReadIncident { client: mcp })
-        .build()
+    Arc::new(move |id: &str| {
+        let id: &'static str = Box::leak(id.to_owned().into_boxed_str());
+        let model = ScriptedModel::new("reader", vec![
+            Step::Call { tool: "read_incident", args: serde_json::json!({ "incident_id": id }) },
+            Step::Say("Timeline collected."),
+        ]);
+        AgentBuilder::new(model)
+            .preamble("You collect one incident's timeline with read_incident and report.")
+            .tool(RemoteReadIncident { client: mcp.clone() })
+            .build()
+    })
 }
 
 #[cfg(not(feature = "agent"))]
-fn build_orchestrator(worker: Agent) -> Agent {
+fn build_worker_factory(mcp: Mcp, reader_factory: WorkerFactory) -> WorkerFactory {
+    use models::{ScriptedModel, Step};
+    Arc::new(move |id: &str| {
+        let peer = if id == "INC-42" { "INC-43" } else { "INC-42" };
+        let (id, peer): (&'static str, &'static str) =
+            (Box::leak(id.to_owned().into_boxed_str()), Box::leak(peer.to_owned().into_boxed_str()));
+        // Both workers read their own incident, then try the peer's. INC-42's
+        // worker also delegates one sub-step, then asks for more than it holds.
+        let mut steps = vec![
+            Step::Call { tool: "read_incident", args: serde_json::json!({ "incident_id": id }) },
+            Step::Call { tool: "read_incident", args: serde_json::json!({ "incident_id": peer }) },
+        ];
+        if id == "INC-42" {
+            steps.push(Step::Call { tool: "delegate_subtask", args: serde_json::json!({ "incident_id": id, "scope": "incident" }) });
+            steps.push(Step::Call { tool: "delegate_subtask", args: serde_json::json!({ "incident_id": id, "scope": "all-incidents" }) });
+        }
+        steps.push(Step::Say("Reported: my incident is open and high severity. The peer incident is outside my authority."));
+        let model = ScriptedModel::new("worker", steps);
+        AgentBuilder::new(model)
+            .preamble("You investigate one incident. Use read_incident, and delegate_subtask for sub-steps. Report what you found and what you could not do.")
+            .tool(RemoteReadIncident { client: mcp.clone() })
+            .tool(DelegateSubtask { reader_factory: reader_factory.clone() })
+            .build()
+    })
+}
+
+#[cfg(not(feature = "agent"))]
+fn build_orchestrator(worker_factory: WorkerFactory) -> Agent {
     use models::{ScriptedModel, Step};
     let model = ScriptedModel::new("orchestrator", vec![
         Step::Call { tool: "scale_cluster", args: serde_json::json!({ "cluster": "staging-web", "replicas": 3 }) },
         Step::Call { tool: "scale_cluster", args: serde_json::json!({ "cluster": "production-web", "replicas": 20 }) },
-        Step::Call { tool: "delegate_incident", args: serde_json::json!({ "incident_id": "INC-42" }) },
-        Step::Say("Scaled staging-web to 3. Scaling production-web to 20 was denied by policy. The worker reports INC-42 is open and high severity, and could not read INC-99."),
+        Step::Calls(vec![
+            ("delegate_incident", serde_json::json!({ "incident_id": "INC-42" })),
+            ("delegate_incident", serde_json::json!({ "incident_id": "INC-43" })),
+        ]),
+        Step::Say("Scaled staging-web to 3. Scaling production-web to 20 was denied by policy. Two workers investigated INC-42 and INC-43 in parallel; each could read only its own incident."),
     ]);
     AgentBuilder::new(model)
         .preamble("You are the on-call orchestrator. Use tools. Never claim an action succeeded if the tool denied it.")
         .tool(ScaleCluster)
-        .tool(DelegateIncident { worker })
+        .tool(DelegateIncident { worker_factory })
         .build()
 }
 
@@ -140,20 +176,34 @@ fn openai() -> rig::providers::openai::Client {
 }
 
 #[cfg(feature = "agent")]
-fn build_worker(mcp: Arc<rmcp::service::RunningService<rmcp::service::RoleClient, ()>>) -> Agent {
-    openai()
-        .agent(rig::providers::openai::GPT_4O)
-        .preamble("You investigate one incident. Use read_incident. Report what you found and what you could not do.")
-        .tool(RemoteReadIncident { client: mcp })
-        .build()
+fn build_reader_factory(mcp: Mcp) -> WorkerFactory {
+    Arc::new(move |_id: &str| {
+        openai()
+            .agent(rig::providers::openai::GPT_4O)
+            .preamble("You collect one incident's timeline with read_incident and report.")
+            .tool(RemoteReadIncident { client: mcp.clone() })
+            .build()
+    })
 }
 
 #[cfg(feature = "agent")]
-fn build_orchestrator(worker: Agent) -> Agent {
+fn build_worker_factory(mcp: Mcp, reader_factory: WorkerFactory) -> WorkerFactory {
+    Arc::new(move |_id: &str| {
+        openai()
+            .agent(rig::providers::openai::GPT_4O)
+            .preamble("You investigate one incident. Use read_incident, and delegate_subtask for sub-steps. Report what you found and what you could not do.")
+            .tool(RemoteReadIncident { client: mcp.clone() })
+            .tool(DelegateSubtask { reader_factory: reader_factory.clone() })
+            .build()
+    })
+}
+
+#[cfg(feature = "agent")]
+fn build_orchestrator(worker_factory: WorkerFactory) -> Agent {
     openai()
         .agent(rig::providers::openai::GPT_4O)
         .preamble("You are the on-call orchestrator. Use tools. Never claim an action succeeded if the tool denied it.")
         .tool(ScaleCluster)
-        .tool(DelegateIncident { worker })
+        .tool(DelegateIncident { worker_factory })
         .build()
 }
