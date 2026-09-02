@@ -76,4 +76,4 @@ Rig's `rmcp_tools()` has a first-class `_meta` channel: a `rmcp::model::Meta` pl
 - `src/tools/incident_mcp.rs`: the Rig tool that calls the MCP server with `_meta.tenuo`.
 - `src/bin/incident_mcp_server.rs`: the MCP server.
 
-Depends on `tenuo` from `main` (pinned in `Cargo.lock`) until 0.2.4 is published.
+Depends on `tenuo` 0.2.4 from crates.io.
