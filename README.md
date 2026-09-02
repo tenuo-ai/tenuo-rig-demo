@@ -2,6 +2,10 @@
 
 A [Rig](https://rig.rs) agent system where every tool call is authorized by a [Tenuo](https://tenuo.ai) warrant: an on-call orchestrator, two worker agents it delegates to in parallel, a reader agent one worker delegates to in turn, and an [MCP](https://modelcontextprotocol.io) server that verifies each call for itself. Everything is standard Rig: ordinary `Tool` impls, `ToolContext`, `agent.prompt()`, and the `rmcp` client.
 
+## What is Tenuo
+
+Tenuo gives each task only the authority it needs. That authority is a signed **warrant**: which tools may be called, which argument values are allowed, for how long, and which key may use it. The warrant travels with the request across agents, tools, and processes. When one agent delegates to another, the new warrant can only narrow. Whoever executes the action verifies the warrant locally, with nothing but the issuer's public key. Tenuo sits alongside the identity and policy systems you already run; it answers what this task may do right now.
+
 ## Run it
 
 ```bash
@@ -63,20 +67,50 @@ If you know Rig, four ideas cover everything in this repo.
 
 ## Architecture
 
+Authority enters at the top and can only shrink on the way down. Every box holds its own key. Every `read_incident` call, from any level, goes to the MCP server at the bottom, which verifies it with nothing but the root public key.
+
 ```text
- control plane (issuer)          agent process                     incident MCP server
- holds the ROOT key              holds its OWN key + a warrant     holds the root PUBLIC key
-        |                                |                                  |
-        |  mint warrant for orchestrator |                                  |
-        +------------------------------->|                                  |
-                                         |  orchestrator agent (Rig)        |
-                                         |    scale_cluster  (local tool)   |
-                                         |    delegate_incident ----+       |
-                                         |                          v       |
-                                         |  worker agent (Rig), child chain |
-                                         |    read_incident --- _meta.tenuo ------> verify chain + signature + constraints
-                                         |                                  |        then run the handler
+  CONTROL PLANE (issuer)                     holds the ROOT private key
+  mints one warrant for the orchestrator
+      │
+      │  warrant: scale_cluster  cluster=staging-*  replicas<=10
+      │           read_incident  incident_id=INC-*
+      │           delegate_*     incident_id=INC-*          ttl 10 min
+      ▼
+  ORCHESTRATOR AGENT (Rig)                   own key · chain depth 1
+      │
+      ├──── delegate_incident(INC-42) ─────────────────┐   same turn,
+      │                                                │   in parallel
+      │  warrant: read_incident  incident_id=INC-42    │
+      │           delegate_subtask                      │
+      │           ttl 5 min · may delegate once more    │
+      ▼                                                ▼
+  WORKER AGENT A                                  WORKER AGENT B
+  own key · chain depth 2                         own key · chain depth 2
+  reads INC-42 only                               reads INC-43 only
+      │
+      │  delegate_subtask(INC-42)
+      │  warrant: read_incident  incident_id=INC-42   ttl 2 min · terminal
+      ▼
+  READER AGENT
+  own key · chain depth 3 · cannot delegate
+      │
+      │  read_incident(INC-42)  +  chain  +  signature over these arguments   (in _meta.tenuo)
+      ▼
+  INCIDENT MCP SERVER (separate process)     holds only the ROOT PUBLIC key
+  verify chain → verify signature → check constraints → run the handler
 ```
+
+How authority shrinks at each hop:
+
+| | issuer | orchestrator | worker | reader |
+|---|---|---|---|---|
+| capabilities | mints any | 4 | 2 | 1 |
+| incidents | any | `INC-*` | one, exact | one, exact |
+| replicas | any | `staging-*`, max 10 | none | none |
+| lifetime | root key | 10 min | 5 min | 2 min |
+| may delegate | yes | yes | once more | no |
+| chain depth | 0 | 1 | 2 | 3 |
 
 Three trust positions hold three different secrets. The issuer holds the root key and mints warrants. The agent process holds its own key and a warrant; it never sees the root key. The MCP server holds only the root public key. `src/issuer.rs` stands in for the control-plane service so the demo runs in one command; the boundary is the same.
 
