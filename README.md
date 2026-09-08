@@ -18,7 +18,7 @@ No API key needed. The default build uses scripted completion models, the same p
 cargo build --bins && OPENAI_API_KEY=... cargo run --features agent --bin demo
 ```
 
-Depends on `tenuo` 0.2.4 from crates.io and `rig` 0.42.
+Depends on `tenuo` 0.2.5 from crates.io and `rig` 0.42.
 
 ## What you'll see
 
