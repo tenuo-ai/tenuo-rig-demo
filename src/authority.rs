@@ -144,7 +144,10 @@ pub fn guarded_value<T>(
             println!("      [tenuo] error  {:<14} {capability}: {e}", run.agent)
         }
         Err(other) => {
-            println!("      [tenuo] error  {:<14} {capability}: {other}", run.agent)
+            println!(
+                "      [tenuo] error  {:<14} {capability}: {other}",
+                run.agent
+            )
         }
     }
 
