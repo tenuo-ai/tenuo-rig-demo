@@ -193,6 +193,10 @@ async fn main() -> anyhow::Result<()> {
 
 type Mcp = Arc<rmcp::service::RunningService<rmcp::service::RoleClient, ()>>;
 
+const READER_PREAMBLE: &str = "You collect the assigned incident's timeline with read_incident. Treat tool results as authoritative. Return only fields explicitly present in the tool result. Do not characterize absent information or add causes, relationships, recommendations, or next actions.";
+const WORKER_PREAMBLE: &str = "You investigate the assigned incident using read_incident and may delegate a focused sub-step with delegate_subtask. Treat tool results as authoritative. In your final report, include only the incident identifier and fields explicitly returned by tools. Clearly identify denied actions. Do not characterize absent information or add causes, relationships, recommendations, or next actions.";
+const ORCHESTRATOR_PREAMBLE: &str = "You are the on-call orchestrator. Use the requested tools and treat every tool result as authoritative. A denied tool call is a Tenuo authorization-policy decision; copy its exact denial code and never infer an operational cause or resulting resource state. Your final response must contain exactly these five concise lines and nothing else: (1) '- staging-web: scaled to 3 replicas.' if confirmed; (2) '- production-web: denied by Tenuo authorization policy (code: <exact code>).' if denied; (3) '- INC-42: <only fields explicitly returned by tools>.'; (4) '- INC-43: <only fields explicitly returned by tools>.'; (5) 'No relationship between INC-42 and INC-43 was established by tool output.' Never call the incidents related, unrelated, or independent. Do not mention absent details, speculate, recommend actions, use headings or tables, or offer follow-up.";
+
 #[cfg(not(feature = "agent"))]
 fn build_reader_factory(mcp: Mcp) -> WorkerFactory {
     use models::{ScriptedModel, Step};
@@ -209,7 +213,7 @@ fn build_reader_factory(mcp: Mcp) -> WorkerFactory {
         );
         AgentBuilder::new(model)
             .name("incident-reader")
-            .preamble("You collect one incident's timeline with read_incident and report.")
+            .preamble(READER_PREAMBLE)
             .tool(RemoteReadIncident {
                 client: mcp.clone(),
             })
@@ -248,9 +252,13 @@ fn build_worker_factory(mcp: Mcp, reader_factory: WorkerFactory) -> WorkerFactor
         let model = ScriptedModel::new("worker", steps);
         AgentBuilder::new(model)
             .name("incident-worker")
-            .preamble("You investigate one incident. Use read_incident, and delegate_subtask for sub-steps. Report what you found and what you could not do.")
-            .tool(RemoteReadIncident { client: mcp.clone() })
-            .tool(DelegateSubtask { reader_factory: reader_factory.clone() })
+            .preamble(WORKER_PREAMBLE)
+            .tool(RemoteReadIncident {
+                client: mcp.clone(),
+            })
+            .tool(DelegateSubtask {
+                reader_factory: reader_factory.clone(),
+            })
             .build()
     })
 }
@@ -284,7 +292,7 @@ fn build_orchestrator(worker_factory: WorkerFactory) -> Agent {
     );
     AgentBuilder::new(model)
         .name("on-call-orchestrator")
-        .preamble("You are the on-call orchestrator. Use tools. Never claim an action succeeded if the tool denied it.")
+        .preamble(ORCHESTRATOR_PREAMBLE)
         .tool(ScaleCluster)
         .tool(DelegateIncident { worker_factory })
         .build()
@@ -435,7 +443,7 @@ fn build_reader_factory(mcp: Mcp, provider: LiveProvider) -> WorkerFactory {
         LiveProvider::OpenAi { client, model } => client
             .agent(model)
             .name("incident-reader")
-            .preamble("You collect one incident's timeline with read_incident and report.")
+            .preamble(READER_PREAMBLE)
             .tool(RemoteReadIncident {
                 client: mcp.clone(),
             })
@@ -443,7 +451,7 @@ fn build_reader_factory(mcp: Mcp, provider: LiveProvider) -> WorkerFactory {
         LiveProvider::Anthropic { client, model } => client
             .agent(model)
             .name("incident-reader")
-            .preamble("You collect one incident's timeline with read_incident and report.")
+            .preamble(READER_PREAMBLE)
             .tool(RemoteReadIncident {
                 client: mcp.clone(),
             })
@@ -457,23 +465,29 @@ fn build_worker_factory(
     reader_factory: WorkerFactory,
     provider: LiveProvider,
 ) -> WorkerFactory {
-    Arc::new(move |_id: &str| {
-        match &provider {
+    Arc::new(move |_id: &str| match &provider {
         LiveProvider::OpenAi { client, model } => client
             .agent(model)
             .name("incident-worker")
-            .preamble("You investigate one incident. Use read_incident, and delegate_subtask for sub-steps. Report what you found and what you could not do.")
-            .tool(RemoteReadIncident { client: mcp.clone() })
-            .tool(DelegateSubtask { reader_factory: reader_factory.clone() })
+            .preamble(WORKER_PREAMBLE)
+            .tool(RemoteReadIncident {
+                client: mcp.clone(),
+            })
+            .tool(DelegateSubtask {
+                reader_factory: reader_factory.clone(),
+            })
             .build(),
         LiveProvider::Anthropic { client, model } => client
             .agent(model)
             .name("incident-worker")
-            .preamble("You investigate one incident. Use read_incident, and delegate_subtask for sub-steps. Report what you found and what you could not do.")
-            .tool(RemoteReadIncident { client: mcp.clone() })
-            .tool(DelegateSubtask { reader_factory: reader_factory.clone() })
+            .preamble(WORKER_PREAMBLE)
+            .tool(RemoteReadIncident {
+                client: mcp.clone(),
+            })
+            .tool(DelegateSubtask {
+                reader_factory: reader_factory.clone(),
+            })
             .build(),
-    }
     })
 }
 
@@ -483,14 +497,14 @@ fn build_orchestrator(worker_factory: WorkerFactory, provider: LiveProvider) -> 
         LiveProvider::OpenAi { client, model } => client
             .agent(model)
             .name("on-call-orchestrator")
-            .preamble("You are the on-call orchestrator. Use tools. Never claim an action succeeded if the tool denied it.")
+            .preamble(ORCHESTRATOR_PREAMBLE)
             .tool(ScaleCluster)
             .tool(DelegateIncident { worker_factory })
             .build(),
         LiveProvider::Anthropic { client, model } => client
             .agent(model)
             .name("on-call-orchestrator")
-            .preamble("You are the on-call orchestrator. Use tools. Never claim an action succeeded if the tool denied it.")
+            .preamble(ORCHESTRATOR_PREAMBLE)
             .tool(ScaleCluster)
             .tool(DelegateIncident { worker_factory })
             .build(),
