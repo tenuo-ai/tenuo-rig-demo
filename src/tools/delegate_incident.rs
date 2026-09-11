@@ -18,7 +18,7 @@ use serde_json::json;
 use tenuo::sdk::prelude::*;
 use tenuo::{constraints, Exact, Wildcard};
 
-use crate::authority::{guarded, RunAuthority, ToolError};
+use crate::authority::{guarded, map_delegation_error, RunAuthority, ToolError};
 
 pub type WorkerFactory = Arc<dyn Fn(&str) -> Agent + Send + Sync>;
 
@@ -86,11 +86,12 @@ impl Tool for DelegateIncident {
             .guard
             .delegate(&parent.authority, &profile)
             .map_err(|e| {
+                let error = map_delegation_error(e);
                 println!(
-                    "      [tenuo] refuse {:<14} mint worker for {id}: {e}",
-                    parent.agent
+                    "      [tenuo] refuse {:<14} mint worker for {id}: {error}",
+                    parent.agent,
                 );
-                ToolError::Operation(format!("delegate: {e}"))
+                error
             })?;
         let label = format!("worker[{id}]");
         println!(
