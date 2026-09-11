@@ -1,4 +1,5 @@
-//! MCP server for `read_incident`. Verifies `_meta.tenuo` before the handler runs.
+//! MCP server for `read_incident`. Verifies
+//! `_meta["ai.tenuo/authorization"]` before the handler runs.
 //!
 //! The server trusts one root public key, passed as TENUO_ROOT_PUBLIC_KEY (hex).
 //! It never sees a private key. Every call must carry a warrant chain rooted
@@ -7,7 +8,7 @@
 use std::time::Duration;
 
 use rmcp::handler::server::wrapper::Parameters;
-use rmcp::model::{ServerCapabilities, ServerInfo};
+use rmcp::model::{CallToolResult, ContentBlock, ServerCapabilities, ServerInfo};
 use rmcp::service::{RequestContext, RoleServer};
 use rmcp::{tool, tool_handler, tool_router, ErrorData as McpError, ServerHandler, ServiceExt};
 use schemars::JsonSchema;
@@ -16,7 +17,10 @@ use tenuo::sdk::prelude::*;
 use tenuo::sdk::transport::mcp_meta::decode_meta;
 use tenuo::PublicKey;
 
+const TENUO_META_KEY: &str = "ai.tenuo/authorization";
+
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct IncidentArgs {
     pub incident_id: String,
 }
@@ -29,7 +33,9 @@ pub struct IncidentServer {
 #[tool_router]
 impl IncidentServer {
     pub fn new(guard: Guard) -> Self {
-        Self { guard: std::sync::Arc::new(guard) }
+        Self {
+            guard: std::sync::Arc::new(guard),
+        }
     }
 
     #[tool(description = "Read an incident record from the security system of record.")]
@@ -37,14 +43,17 @@ impl IncidentServer {
         &self,
         ctx: RequestContext<RoleServer>,
         Parameters(args): Parameters<IncidentArgs>,
-    ) -> Result<String, McpError> {
+    ) -> Result<CallToolResult, McpError> {
         // 1. Pull the Tenuo envelope out of _meta. Missing means deny.
-        let tenuo = ctx.meta.get("tenuo").cloned().ok_or_else(|| {
-            eprintln!("      [mcp-server] refused  read_incident {}: no _meta.tenuo", args.incident_id);
-            McpError::invalid_params("missing _meta.tenuo", None)
+        let tenuo = ctx.meta.get(TENUO_META_KEY).cloned().ok_or_else(|| {
+            eprintln!(
+                "      [mcp-server] refused  read_incident {}: no authorization metadata",
+                args.incident_id
+            );
+            McpError::invalid_params("missing Tenuo authorization metadata", None)
         })?;
         let received = decode_meta(&tenuo)
-            .map_err(|e| McpError::invalid_params(format!("bad _meta.tenuo: {e:?}"), None))?;
+            .map_err(|e| McpError::invalid_params(format!("bad Tenuo metadata: {e:?}"), None))?;
         let received = received
             .as_received()
             .map_err(|e| McpError::invalid_params(format!("bad authority: {e}"), None))?;
@@ -58,7 +67,7 @@ impl IncidentServer {
         // 3. Verify chain + PoP + constraints, then run the handler once.
         let holder = received.leaf().authorized_holder().fingerprint();
         let depth = received.chain().len();
-        let out = self
+        let out = match self
             .guard
             .guard_received(&received, &call, |_| {
                 eprintln!("      [mcp-server] verified read_incident {} for holder {holder} (chain depth {depth})", args.incident_id);
@@ -66,16 +75,24 @@ impl IncidentServer {
                     "{}: severity=high, status=open, owner=secops (served by MCP)",
                     args.incident_id
                 ))
-            })
-            .map_err(|e| match e {
+            }) {
+            Ok(out) => out,
+            Err(e) => match e {
                 GuardError::Denied(d) => {
                     eprintln!("      [mcp-server] denied   read_incident {} for holder {holder}: {}", args.incident_id, d.code());
-                    McpError::invalid_params(format!("denied ({}): {}", d.code(), d.message()), None)
+                    return Ok(CallToolResult::error(vec![ContentBlock::text(format!(
+                        "denied ({}): {}",
+                        d.code(),
+                        d.message()
+                    ))]));
                 }
                 GuardError::Operation(never) => match never {},
-            })?;
+            },
+        };
 
-        Ok(out.into_inner())
+        Ok(CallToolResult::success(vec![ContentBlock::text(
+            out.into_inner(),
+        )]))
     }
 }
 
@@ -84,7 +101,8 @@ impl ServerHandler for IncidentServer {
     fn get_info(&self) -> ServerInfo {
         let mut info = ServerInfo::default();
         info.capabilities = ServerCapabilities::builder().enable_tools().build();
-        info.instructions = Some("Incident records. Every call must carry a Tenuo warrant in _meta.tenuo.".into());
+        info.instructions =
+            Some("Incident records. Every call must carry a Tenuo warrant in namespaced MCP request metadata.".into());
         info
     }
 }
@@ -94,15 +112,24 @@ async fn main() -> anyhow::Result<()> {
     let root_hex = std::env::var("TENUO_ROOT_PUBLIC_KEY")
         .map_err(|_| anyhow::anyhow!("TENUO_ROOT_PUBLIC_KEY (hex) is required"))?;
     let bytes = hex::decode(&root_hex)?;
-    let arr: [u8; 32] = bytes.as_slice().try_into().map_err(|_| anyhow::anyhow!("root key must be 32 bytes"))?;
+    let arr: [u8; 32] = bytes
+        .as_slice()
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("root key must be 32 bytes"))?;
     let root = PublicKey::from_bytes(&arr)?;
 
     let guard = Tenuo::enforcement()
         .trusted_root(root)
-        .revocation(RevocationMode::TtlOnly { max_lifetime: Duration::from_secs(3600) })
+        .revocation(RevocationMode::TtlOnly {
+            max_lifetime: Duration::from_secs(3600),
+        })
+        // The handler emits the customer-facing MCP verification transcript.
+        .denial_reporting(DenialReporting::Debug)
         .build()?;
 
-    let service = IncidentServer::new(guard).serve(rmcp::transport::stdio()).await?;
+    let service = IncidentServer::new(guard)
+        .serve(rmcp::transport::stdio())
+        .await?;
     service.waiting().await?;
     Ok(())
 }

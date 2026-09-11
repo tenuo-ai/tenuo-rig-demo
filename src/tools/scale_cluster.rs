@@ -2,7 +2,7 @@
 //! every dispatch path Rig has (agent loop, streaming, `ToolSet::execute`)
 //! goes through it.
 
-use rig::tool::{Tool, ToolContext};
+use rig::tool::{Tool, ToolContext, ToolExecutionError};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -10,6 +10,7 @@ use serde_json::json;
 use crate::authority::{guarded, ToolError};
 
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct ScaleArgs {
     /// Cluster name, e.g. "staging-web".
     pub cluster: String,
@@ -33,13 +34,25 @@ impl Tool for ScaleCluster {
         json!({
             "type": "object",
             "properties": { "cluster": { "type": "string" }, "replicas": { "type": "integer" } },
-            "required": ["cluster", "replicas"]
+            "required": ["cluster", "replicas"],
+            "additionalProperties": false
         })
     }
 
-    async fn call(&self, ctx: &mut ToolContext, args: Self::Args) -> Result<Self::Output, Self::Error> {
+    fn map_error(&self, error: Self::Error) -> ToolExecutionError {
+        error.into_execution_error()
+    }
+
+    async fn call(
+        &self,
+        ctx: &mut ToolContext,
+        args: Self::Args,
+    ) -> Result<Self::Output, Self::Error> {
         guarded(ctx, Self::NAME, &args, |_| {
-            Ok(format!("scaled {} to {} replicas", args.cluster, args.replicas))
+            Ok(format!(
+                "scaled {} to {} replicas",
+                args.cluster, args.replicas
+            ))
         })
     }
 }

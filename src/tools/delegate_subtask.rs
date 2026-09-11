@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use rig::prelude::*;
-use rig::tool::{Tool, ToolContext};
+use rig::tool::{Tool, ToolContext, ToolExecutionError};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -20,6 +20,7 @@ use crate::authority::{guarded, RunAuthority, ToolError};
 use crate::tools::delegate_incident::WorkerFactory;
 
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct SubtaskArgs {
     /// Incident the sub-step concerns.
     pub incident_id: String,
@@ -53,12 +54,24 @@ impl Tool for DelegateSubtask {
                 "incident_id": { "type": "string" },
                 "scope": { "type": "string", "enum": ["incident", "all-incidents"] }
             },
-            "required": ["incident_id"]
+            "required": ["incident_id"],
+            "additionalProperties": false
         })
     }
 
-    async fn call(&self, ctx: &mut ToolContext, args: Self::Args) -> Result<Self::Output, Self::Error> {
-        let parent = ctx.get::<RunAuthority>().cloned().ok_or(ToolError::NoAuthority)?;
+    fn map_error(&self, error: Self::Error) -> ToolExecutionError {
+        error.into_execution_error()
+    }
+
+    async fn call(
+        &self,
+        ctx: &mut ToolContext,
+        args: Self::Args,
+    ) -> Result<Self::Output, Self::Error> {
+        let parent = ctx
+            .get::<RunAuthority>()
+            .cloned()
+            .ok_or(ToolError::NoAuthority)?;
         guarded(ctx, Self::NAME, &args, |_| Ok(()))?;
 
         let id = args.incident_id.as_str();
@@ -75,8 +88,14 @@ impl Tool for DelegateSubtask {
         let grandchild = match parent.guard.delegate(&parent.authority, &profile) {
             Ok(g) => g,
             Err(e) => {
-                println!("      [tenuo] refuse {:<14} mint for scope={}: {e}", parent.agent, args.scope);
-                return Err(ToolError::Denied { code: "attenuation".into(), message: e.to_string() });
+                println!(
+                    "      [tenuo] refuse {:<14} mint for scope={}: {e}",
+                    parent.agent, args.scope
+                );
+                return Err(ToolError::Denied {
+                    code: "attenuation".into(),
+                    message: e.to_string(),
+                });
             }
         };
         let label = format!("reader[{id}]");
@@ -86,7 +105,11 @@ impl Tool for DelegateSubtask {
             grandchild.holder().fingerprint(),
             grandchild.chain().len()
         );
-        let authority = RunAuthority { guard: parent.guard.clone(), authority: Arc::new(grandchild), agent: label };
+        let authority = RunAuthority {
+            guard: parent.guard.clone(),
+            authority: Arc::new(grandchild),
+            agent: label,
+        };
 
         let reader = (self.reader_factory)(id);
         reader

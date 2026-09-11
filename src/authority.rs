@@ -7,7 +7,7 @@
 use std::fmt;
 use std::sync::Arc;
 
-use rig::tool::ToolContext;
+use rig::tool::{ToolContext, ToolExecutionError, ToolOutput};
 use serde::Serialize;
 use tenuo::sdk::prelude::*;
 
@@ -28,14 +28,39 @@ impl RunAuthority {
     }
 }
 
-/// Error a guarded tool returns. Denials carry only the sanitized code and message,
-/// which is what the model sees as the tool result.
+/// Error a guarded tool returns. Denials carry only a sanitized code and message.
+/// Tool implementations pass these through [`ToolError::into_execution_error`]
+/// so Rig can safely expose them to the model.
 #[derive(Debug)]
 pub enum ToolError {
     NoAuthority,
     Denied { code: String, message: String },
     Arguments(String),
+    Timeout(String),
     Operation(String),
+    McpDenied { message: String, output: ToolOutput },
+}
+
+impl ToolError {
+    /// Normalize domain errors for Rig's runtime, telemetry, and model feedback.
+    pub fn into_execution_error(self) -> ToolExecutionError {
+        match self {
+            Self::NoAuthority => {
+                ToolExecutionError::refused("denied (missing-authority): no authority was provided")
+                    .with_code("missing-authority")
+            }
+            Self::Denied { code, message } => {
+                ToolExecutionError::refused(format!("denied ({code}): {message}")).with_code(code)
+            }
+            Self::Arguments(message) => ToolExecutionError::invalid_args(message),
+            Self::Timeout(message) => ToolExecutionError::timeout(message),
+            Self::Operation(message) => ToolExecutionError::provider(message)
+                .with_model_feedback("the tool's upstream operation failed"),
+            Self::McpDenied { message, output } => ToolExecutionError::refused(message)
+                .with_code("mcp-tool-error")
+                .with_model_output(output),
+        }
+    }
 }
 
 impl fmt::Display for ToolError {
@@ -44,7 +69,9 @@ impl fmt::Display for ToolError {
             Self::NoAuthority => write!(f, "no authority in tool context"),
             Self::Denied { code, message } => write!(f, "denied ({code}): {message}"),
             Self::Arguments(m) => write!(f, "invalid arguments: {m}"),
+            Self::Timeout(m) => write!(f, "operation timed out: {m}"),
             Self::Operation(m) => write!(f, "operation failed: {m}"),
+            Self::McpDenied { message, .. } => write!(f, "MCP tool denied the call: {message}"),
         }
     }
 }
@@ -64,19 +91,42 @@ pub fn guarded<A, T>(
 where
     A: Serialize,
 {
-    let run = ctx.get::<RunAuthority>().cloned().ok_or(ToolError::NoAuthority)?;
     let value = serde_json::to_value(args).map_err(|e| ToolError::Arguments(e.to_string()))?;
-    let call = Call::try_from_json(capability, &value)
+    guarded_value(ctx, capability, &value, op)
+}
+
+/// `guarded`, for callers that must reuse the exact serialized argument value
+/// across authorization and a downstream protocol request.
+pub fn guarded_value<T>(
+    ctx: &mut ToolContext,
+    capability: &'static str,
+    value: &serde_json::Value,
+    op: impl FnOnce(&AuthorizedCall<'_>) -> Result<T, ToolError>,
+) -> Result<T, ToolError> {
+    let run = ctx
+        .get::<RunAuthority>()
+        .cloned()
+        .ok_or(ToolError::NoAuthority)?;
+    let call = Call::try_from_json(capability, value)
         .map_err(|e| ToolError::Arguments(format!("{e:?}")))?;
 
     let summary = value.to_string();
     let result = run.guard.guard(&run.authority, &call, op);
     match &result {
-        Ok(_) => println!("      [tenuo] allow  {:<14} {capability} {summary}", run.agent),
+        Ok(_) => println!(
+            "      [tenuo] allow  {:<14} {capability} {summary}",
+            run.agent
+        ),
         Err(GuardError::Denied(d)) => {
-            println!("      [tenuo] deny   {:<14} {capability} {summary}  ({})", run.agent, d.code())
+            println!(
+                "      [tenuo] deny   {:<14} {capability} {summary}  ({})",
+                run.agent,
+                d.code()
+            )
         }
-        Err(GuardError::Operation(e)) => println!("      [tenuo] error  {:<14} {capability}: {e}", run.agent),
+        Err(GuardError::Operation(e)) => {
+            println!("      [tenuo] error  {:<14} {capability}: {e}", run.agent)
+        }
     }
 
     let guarded = result.map_err(|e| match e {
@@ -88,4 +138,37 @@ where
     })?;
     ctx.insert_result(guarded.decision.metadata.clone());
     Ok(guarded.into_inner())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ToolError;
+
+    #[test]
+    fn denial_is_a_model_visible_rig_refusal() {
+        let error = ToolError::Denied {
+            code: "constraint-violation".into(),
+            message: "Constraint not satisfied".into(),
+        }
+        .into_execution_error();
+
+        assert!(error.is_refusal());
+        assert_eq!(error.code(), Some("constraint-violation"));
+        assert_eq!(
+            error.model_feedback(),
+            Some("denied (constraint-violation): Constraint not satisfied")
+        );
+    }
+
+    #[test]
+    fn operation_diagnostics_are_redacted_from_the_model() {
+        let error = ToolError::Operation("upstream response contained a secret".into())
+            .into_execution_error();
+
+        assert_eq!(
+            error.model_feedback(),
+            Some("the tool's upstream operation failed")
+        );
+        assert!(!error.model_feedback().unwrap().contains("secret"));
+    }
 }

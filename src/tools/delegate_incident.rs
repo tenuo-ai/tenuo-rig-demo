@@ -11,7 +11,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use rig::prelude::*;
-use rig::tool::{Tool, ToolContext};
+use rig::tool::{Tool, ToolContext, ToolExecutionError};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -23,6 +23,7 @@ use crate::authority::{guarded, RunAuthority, ToolError};
 pub type WorkerFactory = Arc<dyn Fn(&str) -> Agent + Send + Sync>;
 
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct DelegateArgs {
     /// Incident the worker may investigate, e.g. "INC-42".
     pub incident_id: String,
@@ -46,30 +47,51 @@ impl Tool for DelegateIncident {
         json!({
             "type": "object",
             "properties": { "incident_id": { "type": "string" } },
-            "required": ["incident_id"]
+            "required": ["incident_id"],
+            "additionalProperties": false
         })
     }
 
-    async fn call(&self, ctx: &mut ToolContext, args: Self::Args) -> Result<Self::Output, Self::Error> {
+    fn map_error(&self, error: Self::Error) -> ToolExecutionError {
+        error.into_execution_error()
+    }
+
+    async fn call(
+        &self,
+        ctx: &mut ToolContext,
+        args: Self::Args,
+    ) -> Result<Self::Output, Self::Error> {
         // 1. Delegating is itself a guarded action on the orchestrator's warrant.
-        let parent = ctx.get::<RunAuthority>().cloned().ok_or(ToolError::NoAuthority)?;
+        let parent = ctx
+            .get::<RunAuthority>()
+            .cloned()
+            .ok_or(ToolError::NoAuthority)?;
         guarded(ctx, Self::NAME, &args, |_| Ok(()))?;
 
         // 2. The worker may read this one incident and delegate one sub-step for
         //    it. Five minutes. It may go one hop deeper, no further.
         let id = args.incident_id.as_str();
         let profile = DelegationProfile::new()
-            .capability("read_incident", constraints! { "incident_id" => Exact::new(id) })
+            .capability(
+                "read_incident",
+                constraints! { "incident_id" => Exact::new(id) },
+            )
             .capability(
                 "delegate_subtask",
                 constraints! { "incident_id" => Exact::new(id), "scope" => Wildcard::new() },
             )
             .ttl(Duration::from_secs(300))
             .max_depth(2);
-        let child = parent.guard.delegate(&parent.authority, &profile).map_err(|e| {
-            println!("      [tenuo] refuse {:<14} mint worker for {id}: {e}", parent.agent);
-            ToolError::Operation(format!("delegate: {e}"))
-        })?;
+        let child = parent
+            .guard
+            .delegate(&parent.authority, &profile)
+            .map_err(|e| {
+                println!(
+                    "      [tenuo] refuse {:<14} mint worker for {id}: {e}",
+                    parent.agent
+                );
+                ToolError::Operation(format!("delegate: {e}"))
+            })?;
         let label = format!("worker[{id}]");
         println!(
             "      [tenuo] child  {:<14} holder={} depth={} ttl=300s may_delegate_to_depth=2",
@@ -77,7 +99,11 @@ impl Tool for DelegateIncident {
             child.holder().fingerprint(),
             child.chain().len()
         );
-        let worker_authority = RunAuthority { guard: parent.guard.clone(), authority: Arc::new(child), agent: label };
+        let worker_authority = RunAuthority {
+            guard: parent.guard.clone(),
+            authority: Arc::new(child),
+            agent: label,
+        };
 
         // 3. Run a fresh worker agent with a fresh context. Only the child authority is in it.
         let worker = (self.worker_factory)(id);

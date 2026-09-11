@@ -3,7 +3,7 @@
 //!
 //! Default mode uses scripted models (Rig's own credential-free pattern), so the
 //! real agent loop runs deterministically with no API key. `--features agent`
-//! swaps in OpenAI over the same tools and prompt.
+//! swaps in OpenAI or Anthropic over the same tools and prompt.
 
 mod authority;
 mod issuer;
@@ -32,7 +32,8 @@ async fn main() -> anyhow::Result<()> {
     let control_plane = issuer::ControlPlane::start();
     let root_public_key = control_plane.root_public_key();
 
-    // ---- Agent process: gets its own key and a minted warrant, never the root --
+    // ---- Agent trust position: its own key and a minted warrant ----------------
+    // This demo keeps the issuer in-process; production separates these services.
     let orchestrator_key = SigningKey::generate();
     let warrant = control_plane.mint_orchestrator_warrant(&orchestrator_key.public_key())?;
 
@@ -40,9 +41,17 @@ async fn main() -> anyhow::Result<()> {
         .trusted_root(root_public_key.clone())
         .chain(vec![warrant])
         .signer(orchestrator_key)
-        .revocation(RevocationMode::TtlOnly { max_lifetime: Duration::from_secs(3600) })
+        .revocation(RevocationMode::TtlOnly {
+            max_lifetime: Duration::from_secs(3600),
+        })
+        // `guarded()` prints the demo's structured allow/deny transcript.
+        .denial_reporting(DenialReporting::Debug)
         .build()?;
-    let run = RunAuthority { guard: Arc::new(guard), authority: Arc::new(authority), agent: "orchestrator".into() };
+    let run = RunAuthority {
+        guard: Arc::new(guard),
+        authority: Arc::new(authority),
+        agent: "orchestrator".into(),
+    };
 
     // ---- MCP server: separate process, configured with the root public key only --
     let server_bin = std::env::current_exe()?
@@ -50,16 +59,36 @@ async fn main() -> anyhow::Result<()> {
         .ok_or_else(|| anyhow::anyhow!("no exe dir"))?
         .join("incident-mcp-server");
     if !server_bin.exists() {
-        anyhow::bail!("{} not found. Run `cargo build --bins` first.", server_bin.display());
+        anyhow::bail!(
+            "{} not found. Run `cargo build --bins` first.",
+            server_bin.display()
+        );
     }
     let mut cmd = tokio::process::Command::new(server_bin);
-    cmd.env("TENUO_ROOT_PUBLIC_KEY", hex::encode(root_public_key.to_bytes()));
+    cmd.env(
+        "TENUO_ROOT_PUBLIC_KEY",
+        hex::encode(root_public_key.to_bytes()),
+    );
     let mcp = Arc::new(().serve(TokioChildProcess::new(cmd)?).await?);
 
     // ---- Agents ---------------------------------------------------------------
+    #[cfg(feature = "agent")]
+    let provider = LiveProvider::from_env()?;
+    #[cfg(feature = "agent")]
+    println!("== live model: {} ==", provider.label());
+
+    #[cfg(not(feature = "agent"))]
     let reader_factory = build_reader_factory(mcp.clone());
+    #[cfg(feature = "agent")]
+    let reader_factory = build_reader_factory(mcp.clone(), provider.clone());
+    #[cfg(not(feature = "agent"))]
     let worker_factory = build_worker_factory(mcp.clone(), reader_factory);
+    #[cfg(feature = "agent")]
+    let worker_factory = build_worker_factory(mcp.clone(), reader_factory, provider.clone());
+    #[cfg(not(feature = "agent"))]
     let orchestrator = build_orchestrator(worker_factory);
+    #[cfg(feature = "agent")]
+    let orchestrator = build_orchestrator(worker_factory, provider);
 
     println!("== on-call orchestrator ==");
     println!("   prompt: scale staging-web to 3, then production-web to 20, then investigate INC-42 and INC-43\n");
@@ -75,27 +104,84 @@ async fn main() -> anyhow::Result<()> {
     println!("\n== attacker with a stolen worker chain ==");
     let stolen_key = SigningKey::generate();
     let profile = DelegationProfile::new()
-        .capability("read_incident", constraints! { "incident_id" => Exact::new("INC-42") })
+        .capability(
+            "read_incident",
+            constraints! { "incident_id" => Exact::new("INC-42") },
+        )
         .ttl(Duration::from_secs(300))
         .terminal();
-    let stolen_chain = run.guard.delegate_to(&run.authority, &stolen_key.public_key(), &profile)?;
+    let stolen_chain = run
+        .guard
+        .delegate_to(&run.authority, &stolen_key.public_key(), &profile)?;
     let forbidden = args! { "incident_id" => "INC-99" };
-    let proof = stolen_chain.last().unwrap().sign(&stolen_key, "read_incident", &forbidden)?;
+    let proof = stolen_chain
+        .last()
+        .unwrap()
+        .sign(&stolen_key, "read_incident", &forbidden)?;
     let mut meta = rmcp::model::RequestMetaObject::new();
-    meta.insert("tenuo".into(), encode_meta(&stolen_chain, &proof, &[])?);
-    let mut params = rmcp::model::CallToolRequestParams::new("read_incident")
-        .with_arguments(serde_json::json!({ "incident_id": "INC-99" }).as_object().cloned().unwrap());
+    meta.insert(
+        "ai.tenuo/authorization".into(),
+        encode_meta(&stolen_chain, &proof, &[])?,
+    );
+    let mut params = rmcp::model::CallToolRequestParams::new("read_incident").with_arguments(
+        serde_json::json!({ "incident_id": "INC-99" })
+            .as_object()
+            .cloned()
+            .unwrap(),
+    );
     params.meta = Some(meta);
     match mcp.call_tool(params).await {
-        Ok(r) if r.is_error.unwrap_or(false) => println!("   server: denied a validly signed call outside the warrant"),
+        Ok(r) if r.is_error.unwrap_or(false) => {
+            println!("   server: returned a tool-level denial for a validly signed call outside the warrant")
+        }
         Ok(_) => println!("   !! server allowed an out-of-scope call"),
-        Err(e) => println!("   server: denied a validly signed call outside the warrant ({})", e.to_string().lines().next().unwrap_or("")),
+        Err(e) => println!(
+            "   server: denied a validly signed call outside the warrant ({})",
+            e.to_string().lines().next().unwrap_or("")
+        ),
     }
-    match mcp.call_tool(rmcp::model::CallToolRequestParams::new("read_incident")
-        .with_arguments(serde_json::json!({ "incident_id": "INC-42" }).as_object().cloned().unwrap())).await {
-        Ok(r) if r.is_error.unwrap_or(false) => println!("   server: refused a call with no warrant at all"),
+
+    // The same envelope cannot be replayed with different arguments: its proof
+    // was signed over INC-99, while this request asks for INC-42.
+    let mut mismatched_meta = rmcp::model::RequestMetaObject::new();
+    mismatched_meta.insert(
+        "ai.tenuo/authorization".into(),
+        encode_meta(&stolen_chain, &proof, &[])?,
+    );
+    let mut mismatched = rmcp::model::CallToolRequestParams::new("read_incident").with_arguments(
+        serde_json::json!({ "incident_id": "INC-42" })
+            .as_object()
+            .cloned()
+            .unwrap(),
+    );
+    mismatched.meta = Some(mismatched_meta);
+    match mcp.call_tool(mismatched).await {
+        Ok(r) if r.is_error.unwrap_or(false) => {
+            println!("   server: rejected a proof signed for different arguments")
+        }
+        Ok(_) => println!("   !! server accepted a proof for different arguments"),
+        Err(e) => println!("   !! server returned a protocol error for a mismatched proof: {e}"),
+    }
+
+    match mcp
+        .call_tool(
+            rmcp::model::CallToolRequestParams::new("read_incident").with_arguments(
+                serde_json::json!({ "incident_id": "INC-42" })
+                    .as_object()
+                    .cloned()
+                    .unwrap(),
+            ),
+        )
+        .await
+    {
+        Ok(r) if r.is_error.unwrap_or(false) => {
+            println!("   server: refused a call with no warrant at all")
+        }
         Ok(_) => println!("   !! server accepted a call with no warrant"),
-        Err(e) => println!("   server: refused a call with no warrant at all ({})", e.to_string().lines().next().unwrap_or("")),
+        Err(e) => println!(
+            "   server: refused a call with no warrant at all ({})",
+            e.to_string().lines().next().unwrap_or("")
+        ),
     }
 
     drop(orchestrator);
@@ -107,18 +193,30 @@ async fn main() -> anyhow::Result<()> {
 
 type Mcp = Arc<rmcp::service::RunningService<rmcp::service::RoleClient, ()>>;
 
+const READER_PREAMBLE: &str = "You collect the assigned incident's timeline with read_incident. Treat tool results as authoritative. Return only fields explicitly present in the tool result. Do not characterize absent information or add causes, relationships, recommendations, or next actions.";
+const WORKER_PREAMBLE: &str = "You investigate the assigned incident using read_incident and may delegate a focused sub-step with delegate_subtask. Treat tool results as authoritative. In your final report, include only the incident identifier and fields explicitly returned by tools. Clearly identify denied actions. Do not characterize absent information or add causes, relationships, recommendations, or next actions.";
+const ORCHESTRATOR_PREAMBLE: &str = "You are the on-call orchestrator. Use the requested tools and treat every tool result as authoritative. A denied tool call is a Tenuo authorization-policy decision; copy its exact denial code and never infer an operational cause or resulting resource state. Your final response must contain exactly these five concise lines and nothing else: (1) '- staging-web: scaled to 3 replicas.' if confirmed; (2) '- production-web: denied by Tenuo authorization policy (code: <exact code>).' if denied; (3) '- INC-42: <only fields explicitly returned by tools>.'; (4) '- INC-43: <only fields explicitly returned by tools>.'; (5) 'No relationship between INC-42 and INC-43 was established by tool output.' Never call the incidents related, unrelated, or independent. Do not mention absent details, speculate, recommend actions, use headings or tables, or offer follow-up.";
+
 #[cfg(not(feature = "agent"))]
 fn build_reader_factory(mcp: Mcp) -> WorkerFactory {
     use models::{ScriptedModel, Step};
     Arc::new(move |id: &str| {
-        let id: &'static str = Box::leak(id.to_owned().into_boxed_str());
-        let model = ScriptedModel::new("reader", vec![
-            Step::Call { tool: "read_incident", args: serde_json::json!({ "incident_id": id }) },
-            Step::Say("Timeline collected."),
-        ]);
+        let model = ScriptedModel::new(
+            "reader",
+            vec![
+                Step::Call {
+                    tool: "read_incident",
+                    args: serde_json::json!({ "incident_id": id }),
+                },
+                Step::Respond(reader_report),
+            ],
+        );
         AgentBuilder::new(model)
-            .preamble("You collect one incident's timeline with read_incident and report.")
-            .tool(RemoteReadIncident { client: mcp.clone() })
+            .name("incident-reader")
+            .preamble(READER_PREAMBLE)
+            .tool(RemoteReadIncident {
+                client: mcp.clone(),
+            })
             .build()
     })
 }
@@ -128,24 +226,39 @@ fn build_worker_factory(mcp: Mcp, reader_factory: WorkerFactory) -> WorkerFactor
     use models::{ScriptedModel, Step};
     Arc::new(move |id: &str| {
         let peer = if id == "INC-42" { "INC-43" } else { "INC-42" };
-        let (id, peer): (&'static str, &'static str) =
-            (Box::leak(id.to_owned().into_boxed_str()), Box::leak(peer.to_owned().into_boxed_str()));
         // Both workers read their own incident, then try the peer's. INC-42's
         // worker also delegates one sub-step, then asks for more than it holds.
         let mut steps = vec![
-            Step::Call { tool: "read_incident", args: serde_json::json!({ "incident_id": id }) },
-            Step::Call { tool: "read_incident", args: serde_json::json!({ "incident_id": peer }) },
+            Step::Call {
+                tool: "read_incident",
+                args: serde_json::json!({ "incident_id": id }),
+            },
+            Step::Call {
+                tool: "read_incident",
+                args: serde_json::json!({ "incident_id": peer }),
+            },
         ];
         if id == "INC-42" {
-            steps.push(Step::Call { tool: "delegate_subtask", args: serde_json::json!({ "incident_id": id, "scope": "incident" }) });
-            steps.push(Step::Call { tool: "delegate_subtask", args: serde_json::json!({ "incident_id": id, "scope": "all-incidents" }) });
+            steps.push(Step::Call {
+                tool: "delegate_subtask",
+                args: serde_json::json!({ "incident_id": id, "scope": "incident" }),
+            });
+            steps.push(Step::Call {
+                tool: "delegate_subtask",
+                args: serde_json::json!({ "incident_id": id, "scope": "all-incidents" }),
+            });
         }
-        steps.push(Step::Say("Reported: my incident is open and high severity. The peer incident is outside my authority."));
+        steps.push(Step::Respond(worker_report));
         let model = ScriptedModel::new("worker", steps);
         AgentBuilder::new(model)
-            .preamble("You investigate one incident. Use read_incident, and delegate_subtask for sub-steps. Report what you found and what you could not do.")
-            .tool(RemoteReadIncident { client: mcp.clone() })
-            .tool(DelegateSubtask { reader_factory: reader_factory.clone() })
+            .name("incident-worker")
+            .preamble(WORKER_PREAMBLE)
+            .tool(RemoteReadIncident {
+                client: mcp.clone(),
+            })
+            .tool(DelegateSubtask {
+                reader_factory: reader_factory.clone(),
+            })
             .build()
     })
 }
@@ -153,57 +266,247 @@ fn build_worker_factory(mcp: Mcp, reader_factory: WorkerFactory) -> WorkerFactor
 #[cfg(not(feature = "agent"))]
 fn build_orchestrator(worker_factory: WorkerFactory) -> Agent {
     use models::{ScriptedModel, Step};
-    let model = ScriptedModel::new("orchestrator", vec![
-        Step::Call { tool: "scale_cluster", args: serde_json::json!({ "cluster": "staging-web", "replicas": 3 }) },
-        Step::Call { tool: "scale_cluster", args: serde_json::json!({ "cluster": "production-web", "replicas": 20 }) },
-        Step::Calls(vec![
-            ("delegate_incident", serde_json::json!({ "incident_id": "INC-42" })),
-            ("delegate_incident", serde_json::json!({ "incident_id": "INC-43" })),
-        ]),
-        Step::Say("Scaled staging-web to 3. Scaling production-web to 20 was denied by policy. Two workers investigated INC-42 and INC-43 in parallel; each could read only its own incident."),
-    ]);
+    let model = ScriptedModel::new(
+        "orchestrator",
+        vec![
+            Step::Call {
+                tool: "scale_cluster",
+                args: serde_json::json!({ "cluster": "staging-web", "replicas": 3 }),
+            },
+            Step::Call {
+                tool: "scale_cluster",
+                args: serde_json::json!({ "cluster": "production-web", "replicas": 20 }),
+            },
+            Step::Calls(vec![
+                (
+                    "delegate_incident",
+                    serde_json::json!({ "incident_id": "INC-42" }),
+                ),
+                (
+                    "delegate_incident",
+                    serde_json::json!({ "incident_id": "INC-43" }),
+                ),
+            ]),
+            Step::Respond(orchestrator_report),
+        ],
+    );
     AgentBuilder::new(model)
-        .preamble("You are the on-call orchestrator. Use tools. Never claim an action succeeded if the tool denied it.")
+        .name("on-call-orchestrator")
+        .preamble(ORCHESTRATOR_PREAMBLE)
         .tool(ScaleCluster)
         .tool(DelegateIncident { worker_factory })
         .build()
 }
 
-#[cfg(feature = "agent")]
-fn openai() -> rig::providers::openai::Client {
-    let key = std::env::var("OPENAI_API_KEY").expect("OPENAI_API_KEY is required for --features agent");
-    rig::providers::openai::Client::new(key).expect("openai client")
+#[cfg(not(feature = "agent"))]
+fn reader_report(request: &rig::completion::CompletionRequest) -> String {
+    let result = models::tool_result_texts(request)
+        .into_iter()
+        .rev()
+        .find(|(name, _)| *name == "read_incident");
+    match result {
+        Some((_, text)) if text.contains("served by MCP") => {
+            format!("Timeline collected from the incident system: {text}")
+        }
+        Some((_, text)) => format!("Timeline collection was denied: {text}"),
+        None => "Timeline collection produced no tool result.".into(),
+    }
+}
+
+#[cfg(not(feature = "agent"))]
+fn worker_report(request: &rig::completion::CompletionRequest) -> String {
+    let results = models::tool_result_texts(request);
+    let read_succeeded = results
+        .iter()
+        .any(|(name, text)| *name == "read_incident" && text.contains("served by MCP"));
+    let denials = results
+        .iter()
+        .filter(|(_, text)| text.contains("denied (") || text.contains("cannot attenuate"))
+        .map(|(_, text)| text.as_str())
+        .collect::<Vec<_>>();
+    format!(
+        "Reported from {} tool results: own incident read {}; {} denied request(s): {}",
+        results.len(),
+        if read_succeeded {
+            "succeeded"
+        } else {
+            "did not succeed"
+        },
+        denials.len(),
+        if denials.is_empty() {
+            "none".into()
+        } else {
+            denials.join(" | ")
+        }
+    )
+}
+
+#[cfg(not(feature = "agent"))]
+fn orchestrator_report(request: &rig::completion::CompletionRequest) -> String {
+    let results = models::tool_result_texts(request);
+    let staging_scaled = results
+        .iter()
+        .any(|(name, text)| *name == "scale_cluster" && text.contains("staging-web"));
+    let production_denial = results
+        .iter()
+        .find(|(name, text)| *name == "scale_cluster" && text.contains("denied ("))
+        .map(|(_, text)| text.as_str())
+        .unwrap_or("no denial result received");
+    let workers = results
+        .iter()
+        .filter(|(name, _)| *name == "delegate_incident")
+        .count();
+    format!(
+        "Staging scale {}. Production scale was denied: {production_denial}. Received {workers} worker report(s).",
+        if staging_scaled { "succeeded" } else { "did not succeed" }
+    )
 }
 
 #[cfg(feature = "agent")]
-fn build_reader_factory(mcp: Mcp) -> WorkerFactory {
-    Arc::new(move |_id: &str| {
-        openai()
-            .agent(rig::providers::openai::GPT_4O)
-            .preamble("You collect one incident's timeline with read_incident and report.")
-            .tool(RemoteReadIncident { client: mcp.clone() })
-            .build()
+#[derive(Clone)]
+enum LiveProvider {
+    OpenAi {
+        client: rig::providers::openai::Client,
+        model: String,
+    },
+    Anthropic {
+        client: rig::providers::anthropic::Client,
+        model: String,
+    },
+}
+
+#[cfg(feature = "agent")]
+impl LiveProvider {
+    fn from_env() -> anyhow::Result<Self> {
+        let selected = std::env::var("LLM_PROVIDER")
+            .ok()
+            .map(|value| value.to_lowercase());
+        let selected = selected.as_deref().unwrap_or_else(|| {
+            if std::env::var_os("OPENAI_API_KEY").is_some() {
+                "openai"
+            } else {
+                "anthropic"
+            }
+        });
+        match selected {
+            "openai" => {
+                let key = std::env::var("OPENAI_API_KEY").map_err(|_| {
+                    anyhow::anyhow!("OPENAI_API_KEY is required for LLM_PROVIDER=openai")
+                })?;
+                let model = std::env::var("OPENAI_MODEL")
+                    .unwrap_or_else(|_| rig::providers::openai::GPT_4O.into());
+                Ok(Self::OpenAi {
+                    client: rig::providers::openai::Client::new(key)?,
+                    model,
+                })
+            }
+            "anthropic" => {
+                let key = std::env::var("ANTHROPIC_API_KEY").map_err(|_| {
+                    anyhow::anyhow!("ANTHROPIC_API_KEY is required for LLM_PROVIDER=anthropic")
+                })?;
+                let model = std::env::var("ANTHROPIC_MODEL").unwrap_or_else(|_| {
+                    rig::providers::anthropic::completion::CLAUDE_SONNET_4_6.into()
+                });
+                let builder = rig::providers::anthropic::Client::builder().api_key(key);
+                let builder = if let Ok(workspace_id) = std::env::var("ANTHROPIC_WORKSPACE_ID") {
+                    let mut headers = http::HeaderMap::new();
+                    headers.insert(
+                        "anthropic-workspace-id",
+                        workspace_id.parse().map_err(|_| {
+                            anyhow::anyhow!("ANTHROPIC_WORKSPACE_ID is not a valid header value")
+                        })?,
+                    );
+                    builder.http_headers(headers)
+                } else {
+                    builder
+                };
+                Ok(Self::Anthropic {
+                    client: builder.build()?,
+                    model,
+                })
+            }
+            other => anyhow::bail!("unsupported LLM_PROVIDER '{other}'; use openai or anthropic"),
+        }
+    }
+
+    fn label(&self) -> String {
+        match self {
+            Self::OpenAi { model, .. } => format!("OpenAI ({model})"),
+            Self::Anthropic { model, .. } => format!("Anthropic ({model})"),
+        }
+    }
+}
+
+#[cfg(feature = "agent")]
+fn build_reader_factory(mcp: Mcp, provider: LiveProvider) -> WorkerFactory {
+    Arc::new(move |_id: &str| match &provider {
+        LiveProvider::OpenAi { client, model } => client
+            .agent(model)
+            .name("incident-reader")
+            .preamble(READER_PREAMBLE)
+            .tool(RemoteReadIncident {
+                client: mcp.clone(),
+            })
+            .build(),
+        LiveProvider::Anthropic { client, model } => client
+            .agent(model)
+            .name("incident-reader")
+            .preamble(READER_PREAMBLE)
+            .tool(RemoteReadIncident {
+                client: mcp.clone(),
+            })
+            .build(),
     })
 }
 
 #[cfg(feature = "agent")]
-fn build_worker_factory(mcp: Mcp, reader_factory: WorkerFactory) -> WorkerFactory {
-    Arc::new(move |_id: &str| {
-        openai()
-            .agent(rig::providers::openai::GPT_4O)
-            .preamble("You investigate one incident. Use read_incident, and delegate_subtask for sub-steps. Report what you found and what you could not do.")
-            .tool(RemoteReadIncident { client: mcp.clone() })
-            .tool(DelegateSubtask { reader_factory: reader_factory.clone() })
-            .build()
+fn build_worker_factory(
+    mcp: Mcp,
+    reader_factory: WorkerFactory,
+    provider: LiveProvider,
+) -> WorkerFactory {
+    Arc::new(move |_id: &str| match &provider {
+        LiveProvider::OpenAi { client, model } => client
+            .agent(model)
+            .name("incident-worker")
+            .preamble(WORKER_PREAMBLE)
+            .tool(RemoteReadIncident {
+                client: mcp.clone(),
+            })
+            .tool(DelegateSubtask {
+                reader_factory: reader_factory.clone(),
+            })
+            .build(),
+        LiveProvider::Anthropic { client, model } => client
+            .agent(model)
+            .name("incident-worker")
+            .preamble(WORKER_PREAMBLE)
+            .tool(RemoteReadIncident {
+                client: mcp.clone(),
+            })
+            .tool(DelegateSubtask {
+                reader_factory: reader_factory.clone(),
+            })
+            .build(),
     })
 }
 
 #[cfg(feature = "agent")]
-fn build_orchestrator(worker_factory: WorkerFactory) -> Agent {
-    openai()
-        .agent(rig::providers::openai::GPT_4O)
-        .preamble("You are the on-call orchestrator. Use tools. Never claim an action succeeded if the tool denied it.")
-        .tool(ScaleCluster)
-        .tool(DelegateIncident { worker_factory })
-        .build()
+fn build_orchestrator(worker_factory: WorkerFactory, provider: LiveProvider) -> Agent {
+    match provider {
+        LiveProvider::OpenAi { client, model } => client
+            .agent(model)
+            .name("on-call-orchestrator")
+            .preamble(ORCHESTRATOR_PREAMBLE)
+            .tool(ScaleCluster)
+            .tool(DelegateIncident { worker_factory })
+            .build(),
+        LiveProvider::Anthropic { client, model } => client
+            .agent(model)
+            .name("on-call-orchestrator")
+            .preamble(ORCHESTRATOR_PREAMBLE)
+            .tool(ScaleCluster)
+            .tool(DelegateIncident { worker_factory })
+            .build(),
+    }
 }

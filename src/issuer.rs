@@ -1,10 +1,10 @@
 //! The control plane. In production this is a separate service: it holds the
 //! root signing key, mints warrants for agents, and publishes revocation lists.
 //!
-//! The agent process never sees the root private key. It receives a minted
-//! warrant plus its own holder key, and every enforcement point receives only
-//! the root *public* key. This module stands in for that service so the demo
-//! runs in one command; the boundary is the same.
+//! In production, the agent process never sees the root private key: it receives
+//! a minted warrant plus its own holder key, and every enforcement point receives
+//! only the root *public* key. This module is an in-process stand-in so the demo
+//! runs in one command; it does not create that production security boundary.
 
 use std::time::Duration;
 
@@ -17,7 +17,9 @@ pub struct ControlPlane {
 
 impl ControlPlane {
     pub fn start() -> Self {
-        Self { root: SigningKey::generate() }
+        Self {
+            root: SigningKey::generate(),
+        }
     }
 
     /// What enforcement points are configured with. Safe to distribute.
