@@ -33,11 +33,19 @@ cargo build --locked --bins && cargo run --locked --bin demo
 
 The default build uses scripted completion models, the same pattern Rig uses for its own credential-free examples. Tool choices are predefined, but each response is derived from the actual `ToolResult` messages in Rig's conversation history. The normal agent loop, dispatch, concurrency, denial propagation, and history handling are real. This keeps the example deterministic without suggesting that a hardcoded transcript proves the integration.
 
-To run the same agents with OpenAI-backed completions:
+To run the same agents with Anthropic-backed completions:
 
 ```bash
-cargo build --locked --bins && OPENAI_API_KEY=... cargo run --locked --features agent --bin demo
+cargo build --locked --bins && LLM_PROVIDER=anthropic ANTHROPIC_API_KEY=... cargo run --locked --features agent --bin demo
 ```
+
+Or with OpenAI:
+
+```bash
+cargo build --locked --bins && LLM_PROVIDER=openai OPENAI_API_KEY=... cargo run --locked --features agent --bin demo
+```
+
+If `LLM_PROVIDER` is omitted, the demo selects OpenAI when `OPENAI_API_KEY` is present and otherwise selects Anthropic. Override the defaults with `OPENAI_MODEL` or `ANTHROPIC_MODEL`.
 
 Depends on `tenuo` 0.2.4 from crates.io and `rig` 0.42.
 

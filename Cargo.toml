@@ -18,7 +18,7 @@ futures = "0.3"
 hex = "0.4"
 
 [features]
-# Real Rig agent loop. Needs OPENAI_API_KEY at run time.
+# Real Rig agent loop. Select OpenAI or Anthropic at run time.
 agent = []
 
 [[bin]]

@@ -22,7 +22,7 @@ jobs:
         run: cargo build --locked --bins
       - name: Run tests
         run: cargo test --locked --all-targets
-      - name: Check real-agent build
+      - name: Check OpenAI and Anthropic agent build
         run: cargo check --locked --features agent --all-targets
       - name: Run scripted demo
         run: cargo run --locked --bin demo

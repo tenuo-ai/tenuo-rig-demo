@@ -3,7 +3,7 @@
 //!
 //! Default mode uses scripted models (Rig's own credential-free pattern), so the
 //! real agent loop runs deterministically with no API key. `--features agent`
-//! swaps in OpenAI over the same tools and prompt.
+//! swaps in OpenAI or Anthropic over the same tools and prompt.
 
 mod authority;
 mod issuer;
@@ -72,9 +72,23 @@ async fn main() -> anyhow::Result<()> {
     let mcp = Arc::new(().serve(TokioChildProcess::new(cmd)?).await?);
 
     // ---- Agents ---------------------------------------------------------------
+    #[cfg(feature = "agent")]
+    let provider = LiveProvider::from_env()?;
+    #[cfg(feature = "agent")]
+    println!("== live model: {} ==", provider.label());
+
+    #[cfg(not(feature = "agent"))]
     let reader_factory = build_reader_factory(mcp.clone());
+    #[cfg(feature = "agent")]
+    let reader_factory = build_reader_factory(mcp.clone(), provider.clone());
+    #[cfg(not(feature = "agent"))]
     let worker_factory = build_worker_factory(mcp.clone(), reader_factory);
+    #[cfg(feature = "agent")]
+    let worker_factory = build_worker_factory(mcp.clone(), reader_factory, provider.clone());
+    #[cfg(not(feature = "agent"))]
     let orchestrator = build_orchestrator(worker_factory);
+    #[cfg(feature = "agent")]
+    let orchestrator = build_orchestrator(worker_factory, provider);
 
     println!("== on-call orchestrator ==");
     println!("   prompt: scale staging-web to 3, then production-web to 20, then investigate INC-42 and INC-43\n");
@@ -341,50 +355,131 @@ fn orchestrator_report(request: &rig::completion::CompletionRequest) -> String {
 }
 
 #[cfg(feature = "agent")]
-fn openai() -> rig::providers::openai::Client {
-    let key =
-        std::env::var("OPENAI_API_KEY").expect("OPENAI_API_KEY is required for --features agent");
-    rig::providers::openai::Client::new(key).expect("openai client")
+#[derive(Clone)]
+enum LiveProvider {
+    OpenAi {
+        client: rig::providers::openai::Client,
+        model: String,
+    },
+    Anthropic {
+        client: rig::providers::anthropic::Client,
+        model: String,
+    },
 }
 
 #[cfg(feature = "agent")]
-fn build_reader_factory(mcp: Mcp) -> WorkerFactory {
-    let client = openai();
-    Arc::new(move |_id: &str| {
-        client
-            .clone()
-            .agent(rig::providers::openai::GPT_4O)
+impl LiveProvider {
+    fn from_env() -> anyhow::Result<Self> {
+        let selected = std::env::var("LLM_PROVIDER")
+            .ok()
+            .map(|value| value.to_lowercase());
+        let selected = selected.as_deref().unwrap_or_else(|| {
+            if std::env::var_os("OPENAI_API_KEY").is_some() {
+                "openai"
+            } else {
+                "anthropic"
+            }
+        });
+        match selected {
+            "openai" => {
+                let key = std::env::var("OPENAI_API_KEY").map_err(|_| {
+                    anyhow::anyhow!("OPENAI_API_KEY is required for LLM_PROVIDER=openai")
+                })?;
+                let model = std::env::var("OPENAI_MODEL")
+                    .unwrap_or_else(|_| rig::providers::openai::GPT_4O.into());
+                Ok(Self::OpenAi {
+                    client: rig::providers::openai::Client::new(key)?,
+                    model,
+                })
+            }
+            "anthropic" => {
+                let key = std::env::var("ANTHROPIC_API_KEY").map_err(|_| {
+                    anyhow::anyhow!("ANTHROPIC_API_KEY is required for LLM_PROVIDER=anthropic")
+                })?;
+                let model = std::env::var("ANTHROPIC_MODEL").unwrap_or_else(|_| {
+                    rig::providers::anthropic::completion::CLAUDE_SONNET_4_6.into()
+                });
+                Ok(Self::Anthropic {
+                    client: rig::providers::anthropic::Client::new(key)?,
+                    model,
+                })
+            }
+            other => anyhow::bail!("unsupported LLM_PROVIDER '{other}'; use openai or anthropic"),
+        }
+    }
+
+    fn label(&self) -> String {
+        match self {
+            Self::OpenAi { model, .. } => format!("OpenAI ({model})"),
+            Self::Anthropic { model, .. } => format!("Anthropic ({model})"),
+        }
+    }
+}
+
+#[cfg(feature = "agent")]
+fn build_reader_factory(mcp: Mcp, provider: LiveProvider) -> WorkerFactory {
+    Arc::new(move |_id: &str| match &provider {
+        LiveProvider::OpenAi { client, model } => client
+            .agent(model)
             .name("incident-reader")
             .preamble("You collect one incident's timeline with read_incident and report.")
             .tool(RemoteReadIncident {
                 client: mcp.clone(),
             })
-            .build()
+            .build(),
+        LiveProvider::Anthropic { client, model } => client
+            .agent(model)
+            .name("incident-reader")
+            .preamble("You collect one incident's timeline with read_incident and report.")
+            .tool(RemoteReadIncident {
+                client: mcp.clone(),
+            })
+            .build(),
     })
 }
 
 #[cfg(feature = "agent")]
-fn build_worker_factory(mcp: Mcp, reader_factory: WorkerFactory) -> WorkerFactory {
-    let client = openai();
+fn build_worker_factory(
+    mcp: Mcp,
+    reader_factory: WorkerFactory,
+    provider: LiveProvider,
+) -> WorkerFactory {
     Arc::new(move |_id: &str| {
-        client
-            .clone()
-            .agent(rig::providers::openai::GPT_4O)
+        match &provider {
+        LiveProvider::OpenAi { client, model } => client
+            .agent(model)
             .name("incident-worker")
             .preamble("You investigate one incident. Use read_incident, and delegate_subtask for sub-steps. Report what you found and what you could not do.")
             .tool(RemoteReadIncident { client: mcp.clone() })
             .tool(DelegateSubtask { reader_factory: reader_factory.clone() })
-            .build()
+            .build(),
+        LiveProvider::Anthropic { client, model } => client
+            .agent(model)
+            .name("incident-worker")
+            .preamble("You investigate one incident. Use read_incident, and delegate_subtask for sub-steps. Report what you found and what you could not do.")
+            .tool(RemoteReadIncident { client: mcp.clone() })
+            .tool(DelegateSubtask { reader_factory: reader_factory.clone() })
+            .build(),
+    }
     })
 }
 
 #[cfg(feature = "agent")]
-fn build_orchestrator(worker_factory: WorkerFactory) -> Agent {
-    openai()
-        .agent(rig::providers::openai::GPT_4O)
-        .name("on-call-orchestrator")
-        .preamble("You are the on-call orchestrator. Use tools. Never claim an action succeeded if the tool denied it.")
-        .tool(ScaleCluster)
-        .tool(DelegateIncident { worker_factory })
-        .build()
+fn build_orchestrator(worker_factory: WorkerFactory, provider: LiveProvider) -> Agent {
+    match provider {
+        LiveProvider::OpenAi { client, model } => client
+            .agent(model)
+            .name("on-call-orchestrator")
+            .preamble("You are the on-call orchestrator. Use tools. Never claim an action succeeded if the tool denied it.")
+            .tool(ScaleCluster)
+            .tool(DelegateIncident { worker_factory })
+            .build(),
+        LiveProvider::Anthropic { client, model } => client
+            .agent(model)
+            .name("on-call-orchestrator")
+            .preamble("You are the on-call orchestrator. Use tools. Never claim an action succeeded if the tool denied it.")
+            .tool(ScaleCluster)
+            .tool(DelegateIncident { worker_factory })
+            .build(),
+    }
 }
