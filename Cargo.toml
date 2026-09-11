@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2021"
 publish = false
 description = "Rig agent whose tools are enforced by Tenuo warrants: constrained arguments, delegation that only narrows, and an MCP hop verified on the server."
+license = "Apache-2.0"
 
 [dependencies]
 tenuo = { version = "0.2.5", features = ["sdk", "mcp-transport"] }

@@ -215,3 +215,7 @@ The demo keeps issuance, agents, and enforcement runnable in one command. [PRODU
 - [`tests/demo_boundaries.rs`](tests/demo_boundaries.rs): end-to-end assertions over the scripted Rig and MCP flow.
 - [`PRODUCTION.md`](PRODUCTION.md): production considerations and the choices involved in adapting the example.
 - [`.github/workflows/ci.yml`](.github/workflows/ci.yml): formatting, strict Clippy, locked builds, tests, optional agent compilation, and a scripted demo smoke run.
+
+## License
+
+Licensed under the [Apache License 2.0](LICENSE).
