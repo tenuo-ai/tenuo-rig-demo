@@ -16,7 +16,7 @@ use serde_json::json;
 use tenuo::sdk::prelude::*;
 use tenuo::{constraints, Exact};
 
-use crate::authority::{guarded, RunAuthority, ToolError};
+use crate::authority::{guarded, map_delegation_error, RunAuthority, ToolError};
 use crate::tools::delegate_incident::WorkerFactory;
 
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
@@ -88,14 +88,12 @@ impl Tool for DelegateSubtask {
         let grandchild = match parent.guard.delegate(&parent.authority, &profile) {
             Ok(g) => g,
             Err(e) => {
+                let error = map_delegation_error(e);
                 println!(
-                    "      [tenuo] refuse {:<14} mint for scope={}: {e}",
-                    parent.agent, args.scope
+                    "      [tenuo] refuse {:<14} mint for scope={}: {error}",
+                    parent.agent, args.scope,
                 );
-                return Err(ToolError::Denied {
-                    code: "attenuation".into(),
-                    message: e.to_string(),
-                });
+                return Err(error);
             }
         };
         let label = format!("reader[{id}]");

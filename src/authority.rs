@@ -78,6 +78,22 @@ impl fmt::Display for ToolError {
 
 impl std::error::Error for ToolError {}
 
+/// Preserve policy denials and canonical Tenuo codes while keeping signer and
+/// authority-construction failures out of model-visible diagnostics.
+pub fn map_delegation_error(error: DelegationError) -> ToolError {
+    match error {
+        DelegationError::Denied(denial) => ToolError::Denied {
+            code: denial.code().into(),
+            message: denial.message().into(),
+        },
+        DelegationError::Core(error) => ToolError::Denied {
+            code: error.code().name().into(),
+            message: error.to_string(),
+        },
+        other => ToolError::Operation(format!("delegate: {other}")),
+    }
+}
+
 /// Run `op` only if the warrant in `ctx` allows `capability` with `args`.
 ///
 /// On allow, the decision record goes into the context's host-only result slot,

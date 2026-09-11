@@ -6,6 +6,8 @@ An on-call orchestrator delegates work to two parallel agents, and one worker de
 
 The integration uses standard Rig and MCP APIs: ordinary `Tool` implementations, `ToolContext`, `agent.prompt()`, Rig concurrency, the `rmcp` client, and an `rmcp` server over a child-process transport.
 
+The Rig-facing integration is deliberately small: one `guarded()` helper reads authority from `ToolContext`, and every tool follows one convention—call the guard before doing work. The remaining code is ordinary application tools and delegation policy.
+
 ## What the example includes
 
 | Component | Demonstrated behavior | Implementation |
@@ -15,7 +17,7 @@ The integration uses standard Rig and MCP APIs: ordinary `Tool` implementations,
 | MCP enforcement | Per-call authorization in `_meta["ai.tenuo/authorization"]`, verified before the operation | Separate child process |
 | Issuance | Root authority mints the orchestrator warrant | In-process demo issuer |
 | Operations | Cluster scaling and incident reads | Example handlers with no external side effects |
-| Model | Deterministic scripted completion by default, with optional OpenAI completions | Selectable at build time |
+| Model | Deterministic scripted completion by default, with optional OpenAI or Anthropic completions | Scripted or live at build time; live provider selected at runtime |
 
 The repository is an executable integration example rather than a reusable adapter crate. The [production considerations](#production-considerations) describe how the demo setup maps to a deployed system.
 
@@ -31,9 +33,9 @@ Prerequisites: a stable Rust toolchain and Linux or macOS. No API key is needed 
 cargo build --locked --bins && cargo run --locked --bin demo
 ```
 
-The default build uses scripted completion models, the same pattern Rig uses for its own credential-free examples. Tool choices are predefined, but each response is derived from the actual `ToolResult` messages in Rig's conversation history. The normal agent loop, dispatch, concurrency, denial propagation, and history handling are real. This keeps the example deterministic without suggesting that a hardcoded transcript proves the integration.
+The default build uses scripted completion models, the same pattern Rig uses for its own credential-free examples. Tool choices are predefined, but each response is derived from the actual `ToolResult` messages in Rig's conversation history. The normal agent loop, dispatch, concurrency, denial propagation, and history handling are real. This deterministic path is the security-conformance demonstration: it reliably exercises the allow, denial, peer-isolation, non-widening, and nested-delegation scenarios.
 
-To run the same agents with Anthropic-backed completions:
+To validate the same agent graph with Anthropic-backed completions:
 
 ```bash
 cargo build --locked --bins && LLM_PROVIDER=anthropic ANTHROPIC_API_KEY=... cargo run --locked --features agent --bin demo
@@ -44,6 +46,8 @@ Or with OpenAI:
 ```bash
 cargo build --locked --bins && LLM_PROVIDER=openai OPENAI_API_KEY=... cargo run --locked --features agent --bin demo
 ```
+
+Live models choose their own tool sequence and wording, so a live run may not reproduce every security scene in the deterministic transcript. The live prompt constrains claims to tool evidence rather than prescribing a fixed response. Authorization is enforced on every call regardless of which sequence the model chooses.
 
 If `LLM_PROVIDER` is omitted, the demo selects OpenAI when `OPENAI_API_KEY` is present and otherwise selects Anthropic. Override the defaults with `OPENAI_MODEL` or `ANTHROPIC_MODEL`.
 
@@ -57,7 +61,7 @@ To run the end-to-end security checks:
 cargo test --locked --all-targets
 ```
 
-The tests execute the complete scripted flow and assert Rig argument denials, model-visible refusal details, peer isolation, non-widening delegation, independent MCP verification, and server-side rejection of bypass attempts.
+The tests execute the complete scripted flow and assert Rig argument denials, model-visible refusal details, peer isolation, non-widening delegation, holder binding, independent MCP verification, server-side rejection of bypass attempts, and explicit replay behavior.
 
 ## Code walkthrough
 
@@ -91,15 +95,21 @@ The tests execute the complete scripted flow and assert Rig argument denials, mo
       [tenuo] deny   worker[INC-43] read_incident {"incident_id":"INC-42"}  (constraint-violation)
       [mcp-server] verified read_incident INC-42 for holder ff77f521325ddf45 (chain depth 3)
       [tenuo] allow  worker[INC-42] delegate_subtask {"incident_id":"INC-42","scope":"all-incidents"}
-      [tenuo] refuse worker[INC-42] mint for scope=all-incidents: incompatible constraint types: cannot attenuate Exact to Pattern
+      [tenuo] refuse worker[INC-42] mint for scope=all-incidents: denied (invalid-attenuation): incompatible constraint types: cannot attenuate Exact to Pattern
 
    orchestrator: Staging scale succeeded. Production scale was denied: denied (constraint-violation): Constraint not satisfied. Received 2 worker report(s).
 
-== attacker with a stolen worker chain ==
+== attacker simulations outside Rig ==
+      [mcp-server] denied   read_incident INC-42 for holder 8c7e4fa9433ac335: signature-invalid
+   server: rejected a copied warrant signed by a different key
       [mcp-server] denied   read_incident INC-99 for holder 8c7e4fa9433ac335: constraint-violation
-   server: returned a tool-level denial for a validly signed call outside the warrant
+   server: bounded a compromised holder to its warrant
       [mcp-server] denied   read_incident INC-42 for holder 8c7e4fa9433ac335: signature-invalid
    server: rejected a proof signed for different arguments
+      [mcp-server] verified read_incident INC-42 for holder 8c7e4fa9433ac335 (chain depth 2)
+   server: accepted a valid call from the compromised holder
+      [mcp-server] verified read_incident INC-42 for holder 8c7e4fa9433ac335 (chain depth 2)
+   server: accepted an identical replay (demo has no deduplication)
       [mcp-server] refused  read_incident INC-42: no authorization metadata
    server: refused a call with no warrant at all (Mcp error: -32602: missing Tenuo authorization metadata)
 ```
@@ -173,8 +183,8 @@ The MCP server runs as a separate child process and receives only the root publi
 
 1. **A constrained tool.** The orchestrator scales `staging-web` to 3 and is denied `production-web`: the warrant allows `staging-*` up to 10 replicas. The denial returns to the model as a tool result, and the model reports it.
 2. **Two workers, one turn, disjoint scope.** The orchestrator delegates INC-42 and INC-43 in the same turn under `tool_concurrency(2)`. `delegate_incident` mints each worker its own chain and key, builds a fresh `ToolContext` holding only that, and prompts a new worker agent. Each worker reads its own incident and is denied the other's. Peers with the same role cannot reach each other's data.
-3. **A second hop that cannot widen.** The INC-42 worker hands a sub-step to a reader agent through `delegate_subtask`. The reader gets a terminal chain and its own key, and the server verifies it at chain depth 3. The worker then asks for `all-incidents` scope, more than it holds, and the mint is refused before any agent runs: `Exact("INC-42")` cannot become `Pattern("INC-*")`.
-4. **The server is the boundary.** The last section constructs a fresh terminal credential equivalent to a compromised worker credential: the attacker controls both its warrant chain and matching holder key. It then skips the client guard and signs a call for an incident the warrant forbids. The server denies it. It also rejects reuse of that proof with different arguments and refuses a call with no authorization metadata. This models full holder compromise, not theft of a warrant without its key.
+3. **A second hop that cannot widen.** The INC-42 worker hands a sub-step to a reader agent through `delegate_subtask`. The reader gets a terminal chain and its own key, and the server verifies it at chain depth 3. The worker then asks for `all-incidents` scope, more than it holds. The first `allow` means the worker may invoke `delegate_subtask` for that incident; minting the requested child is a separate narrowing check, which fails with Tenuo's canonical `invalid-attenuation` code before any agent runs: `Exact("INC-42")` cannot become `Pattern("INC-*")`.
+4. **The server is the boundary.** The attacker simulations bypass the client guard. First, a copied warrant signed with another key is rejected, demonstrating holder binding. A fresh terminal credential then models a fully compromised worker holder: even with its matching private key, an out-of-scope call is denied, and changing signed arguments invalidates the proof. Finally, the demo makes the replay limitation visible by sending one valid envelope twice; this stateless, read-only server accepts both. A call with no authorization metadata is refused at the protocol boundary.
 
 The nested agents use the agent-as-tool pattern with one deliberate difference from `Agent::into_tool()`: that method forwards the parent's `ToolContext`, which would hand a worker the orchestrator's full authority. `delegate_incident` and `delegate_subtask` build a fresh context holding only the narrower chain.
 
@@ -183,6 +193,8 @@ The nested agents use the agent-as-tool pattern with one deliberate difference f
 `src/tools/incident_mcp.rs` is a Rig `Tool` that drives the `rmcp` client directly. It serializes the typed arguments once, rejects unknown fields, and uses that same object for authorization and `CallToolRequestParams`. Only an allowed call produces the namespaced `_meta["ai.tenuo/authorization"]` envelope. Calls use RMCP cancellation with a 30-second timeout, and the complete `CallToolResult` is retained in the host-only `ToolContext`; structured and non-text blocks remain available to the model rather than being flattened away. The server side is a standard `rmcp` server (`src/bin/incident_mcp_server.rs`) that verifies the chain, proof, and arguments before running the operation.
 
 `Guard::guard` accepts a synchronous closure, so this demo creates the signed envelope inside the guard and performs the asynchronous network request afterward. That client check prevents denied calls from producing credentials or reaching the wire, but the independently configured MCP server is the authoritative enforcement point for the remote action. It rejects missing, invalid, stale, expired, or out-of-scope authority even when a caller bypasses the client helper.
+
+The MCP failure shape reflects where validation failed. Missing or malformed authorization metadata is an invalid protocol request and returns JSON-RPC `-32602`; a well-formed credential rejected by Tenuo policy returns an MCP tool-level error result that an agent can handle in its normal tool loop.
 
 Rig 0.42 already forwards an `rmcp::model::Meta` from `ToolContext` as `_meta`, which covers bearer tokens and session ids. That value is read from the run's context before the model chooses arguments. Tenuo's signature covers the normalized arguments, so it can only be produced after the model chooses them. This small custom tool preserves the normal adapter's important call timeout, cancellation, rich-result, and host-metadata behavior, but it does not implement dynamic tool discovery or `tools/list_changed` reconciliation. Support for per-call `_meta` derived from the chosen call is tracked upstream in [rig#2442](https://github.com/0xPlaygrounds/rig/issues/2442).
 
@@ -195,7 +207,7 @@ The example prioritizes a small, one-command setup. A production integration sho
 - **Do not rely on the client guard as the remote trust boundary.** Client-side denial saves a network call and avoids releasing an envelope. Server verification remains mandatory because callers can bypass or compromise the client.
 - **Holder compromise remains bounded, not harmless.** An attacker with both a warrant chain and its holder key can make valid calls within that warrant. Narrow constraints, short lifetimes, delegation depth limits, revocation, and server enforcement bound the damage.
 - **Configure revocation for the deployment.** This example uses TTL-only revocation. Systems that require invalidation before expiry should configure a fail-closed revocation source and define its freshness and outage behavior.
-- **Add application-level deduplication where exact replay matters.** The current proof scheme is stateless: a captured valid request can be replayed unchanged within its short proof window. Non-idempotent handlers should atomically claim `Warrant::dedup_key(tool, args)` in a shared store before performing the action and retain it for at least `Warrant::dedup_ttl_secs()`.
+- **Add application-level deduplication where exact replay matters.** The attacker scene deliberately shows that this stateless, read-only handler accepts a captured valid request again within its short proof window. Non-idempotent handlers should atomically claim `Warrant::dedup_key(tool, args)` in a shared store before performing the action and retain it for at least `Warrant::dedup_ttl_secs()`.
 - **Logs and errors need a disclosure policy.** The transcript prints full arguments and some internal error details for teaching value. Production code should redact arguments by default, expose stable denial codes to callers, and keep diagnostic causes in protected logs.
 - **Use one canonical argument view.** The values checked, signed, transmitted, and reconstructed by the verifier must be semantically identical. The demo serializes once, rejects unknown fields, constructs the outbound arguments and authorization metadata together, and fails closed on serialization errors.
 - **Manage holder-key lifecycle explicitly.** Generated in-memory keys are appropriate for this short-lived run. Long-running services should define holder-key storage, tenant isolation, rotation, and destruction.
@@ -226,4 +238,4 @@ These choices determine the integration surface without changing the delegation 
 - [`src/tools/incident_mcp.rs`](src/tools/incident_mcp.rs): the Rig tool that calls the MCP server with namespaced authorization metadata.
 - [`src/bin/incident_mcp_server.rs`](src/bin/incident_mcp_server.rs): the MCP server.
 - [`tests/demo_boundaries.rs`](tests/demo_boundaries.rs): end-to-end assertions over the scripted Rig and MCP flow.
-- [`.github/workflows/ci.yml`](.github/workflows/ci.yml): formatting, locked builds, tests, optional agent compilation, and a scripted demo smoke run.
+- [`.github/workflows/ci.yml`](.github/workflows/ci.yml): formatting, strict Clippy, locked builds, tests, optional agent compilation, and a scripted demo smoke run.

@@ -60,6 +60,7 @@ fn delegated_workers_are_isolated_and_cannot_widen_authority() {
     ));
     assert!(output.stdout.contains("reader[INC-42] holder="));
     assert!(output.stdout.contains("depth=3 ttl=120s terminal"));
+    assert!(output.stdout.contains("denied (invalid-attenuation)"));
     assert!(output.stdout.contains("cannot attenuate Exact to Pattern"));
 }
 
@@ -77,14 +78,17 @@ fn mcp_server_verifies_delegated_calls_independently() {
 }
 
 #[test]
-fn mcp_server_rejects_client_bypass_attempts() {
+fn mcp_server_enforces_holder_binding_scope_and_argument_integrity() {
     let output = demo_output();
+    assert!(output
+        .stdout
+        .contains("server: rejected a copied warrant signed by a different key"));
     assert!(output
         .stderr
         .contains("[mcp-server] denied   read_incident INC-99"));
-    assert!(output.stdout.contains(
-        "server: returned a tool-level denial for a validly signed call outside the warrant"
-    ));
+    assert!(output
+        .stdout
+        .contains("server: bounded a compromised holder to its warrant"));
     assert!(output
         .stdout
         .contains("server: rejected a proof signed for different arguments"));
@@ -94,6 +98,17 @@ fn mcp_server_rejects_client_bypass_attempts() {
     assert!(output
         .stdout
         .contains("server: refused a call with no warrant at all"));
+}
+
+#[test]
+fn demo_discloses_that_identical_replay_is_accepted() {
+    let output = demo_output();
+    assert!(output
+        .stdout
+        .contains("server: accepted a valid call from the compromised holder"));
+    assert!(output
+        .stdout
+        .contains("server: accepted an identical replay (demo has no deduplication)"));
 }
 
 #[test]

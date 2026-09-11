@@ -100,9 +100,11 @@ async fn main() -> anyhow::Result<()> {
         .await?;
     println!("\n   orchestrator: {answer}");
 
-    // ---- Attacker: outside any agent. Stolen chain and key, bypasses the client guard.
-    println!("\n== attacker with a stolen worker chain ==");
-    let stolen_key = SigningKey::generate();
+    // ---- Attacker simulations: outside Rig and bypassing the client guard. ----
+    // This fresh terminal credential models a fully compromised holder: the
+    // attacker controls both its chain and the private key bound to its leaf.
+    println!("\n== attacker simulations outside Rig ==");
+    let compromised_key = SigningKey::generate();
     let profile = DelegationProfile::new()
         .capability(
             "read_incident",
@@ -110,29 +112,59 @@ async fn main() -> anyhow::Result<()> {
         )
         .ttl(Duration::from_secs(300))
         .terminal();
-    let stolen_chain = run
-        .guard
-        .delegate_to(&run.authority, &stolen_key.public_key(), &profile)?;
-    let forbidden = args! { "incident_id" => "INC-99" };
-    let proof = stolen_chain
-        .last()
-        .unwrap()
-        .sign(&stolen_key, "read_incident", &forbidden)?;
-    let mut meta = rmcp::model::RequestMetaObject::new();
-    meta.insert(
-        "ai.tenuo/authorization".into(),
-        encode_meta(&stolen_chain, &proof, &[])?,
+    let compromised_chain =
+        run.guard
+            .delegate_to(&run.authority, &compromised_key.public_key(), &profile)?;
+
+    let request = |incident_id: &str, authorization| {
+        let mut meta = rmcp::model::RequestMetaObject::new();
+        meta.insert("ai.tenuo/authorization".into(), authorization);
+        let mut params = rmcp::model::CallToolRequestParams::new("read_incident").with_arguments(
+            serde_json::json!({ "incident_id": incident_id })
+                .as_object()
+                .cloned()
+                .unwrap(),
+        );
+        params.meta = Some(meta);
+        params
+    };
+
+    // A copied warrant chain is not enough: proof signed by any key other than
+    // the leaf's authorized holder must fail.
+    let allowed = args! { "incident_id" => "INC-42" };
+    let attacker_key = SigningKey::generate();
+    let forged_proof =
+        compromised_chain
+            .last()
+            .unwrap()
+            .sign(&attacker_key, "read_incident", &allowed)?;
+    let forged = request(
+        "INC-42",
+        encode_meta(&compromised_chain, &forged_proof, &[])?,
     );
-    let mut params = rmcp::model::CallToolRequestParams::new("read_incident").with_arguments(
-        serde_json::json!({ "incident_id": "INC-99" })
-            .as_object()
-            .cloned()
-            .unwrap(),
-    );
-    params.meta = Some(meta);
-    match mcp.call_tool(params).await {
+    match mcp.call_tool(forged).await {
         Ok(r) if r.is_error.unwrap_or(false) => {
-            println!("   server: returned a tool-level denial for a validly signed call outside the warrant")
+            println!("   server: rejected a copied warrant signed by a different key")
+        }
+        Ok(_) => println!("   !! server accepted a copied warrant without holder proof"),
+        Err(e) => println!("   !! server returned a protocol error for holder proof: {e}"),
+    }
+
+    // With both chain and holder key compromised, calls remain bounded by the
+    // warrant's argument constraints.
+    let forbidden = args! { "incident_id" => "INC-99" };
+    let forbidden_proof =
+        compromised_chain
+            .last()
+            .unwrap()
+            .sign(&compromised_key, "read_incident", &forbidden)?;
+    let out_of_scope = request(
+        "INC-99",
+        encode_meta(&compromised_chain, &forbidden_proof, &[])?,
+    );
+    match mcp.call_tool(out_of_scope).await {
+        Ok(r) if r.is_error.unwrap_or(false) => {
+            println!("   server: bounded a compromised holder to its warrant")
         }
         Ok(_) => println!("   !! server allowed an out-of-scope call"),
         Err(e) => println!(
@@ -141,26 +173,41 @@ async fn main() -> anyhow::Result<()> {
         ),
     }
 
-    // The same envelope cannot be replayed with different arguments: its proof
-    // was signed over INC-99, while this request asks for INC-42.
-    let mut mismatched_meta = rmcp::model::RequestMetaObject::new();
-    mismatched_meta.insert(
-        "ai.tenuo/authorization".into(),
-        encode_meta(&stolen_chain, &proof, &[])?,
+    // Argument substitution is not replay: changing INC-99 to INC-42 invalidates
+    // the proof because the normalized arguments are part of the signature.
+    let mismatched = request(
+        "INC-42",
+        encode_meta(&compromised_chain, &forbidden_proof, &[])?,
     );
-    let mut mismatched = rmcp::model::CallToolRequestParams::new("read_incident").with_arguments(
-        serde_json::json!({ "incident_id": "INC-42" })
-            .as_object()
-            .cloned()
-            .unwrap(),
-    );
-    mismatched.meta = Some(mismatched_meta);
     match mcp.call_tool(mismatched).await {
         Ok(r) if r.is_error.unwrap_or(false) => {
             println!("   server: rejected a proof signed for different arguments")
         }
         Ok(_) => println!("   !! server accepted a proof for different arguments"),
         Err(e) => println!("   !! server returned a protocol error for a mismatched proof: {e}"),
+    }
+
+    // Exact replay is accepted by this stateless, read-only demo. Production
+    // handlers with non-idempotent effects must claim the SDK deduplication key.
+    let valid_proof =
+        compromised_chain
+            .last()
+            .unwrap()
+            .sign(&compromised_key, "read_incident", &allowed)?;
+    let valid_envelope = encode_meta(&compromised_chain, &valid_proof, &[])?;
+    let first = mcp
+        .call_tool(request("INC-42", valid_envelope.clone()))
+        .await?;
+    if !first.is_error.unwrap_or(false) {
+        println!("   server: accepted a valid call from the compromised holder");
+    } else {
+        println!("   !! server denied a valid in-scope call");
+    }
+    let replay = mcp.call_tool(request("INC-42", valid_envelope)).await?;
+    if !replay.is_error.unwrap_or(false) {
+        println!("   server: accepted an identical replay (demo has no deduplication)");
+    } else {
+        println!("   !! server denied an identical replay unexpectedly");
     }
 
     match mcp
@@ -195,7 +242,7 @@ type Mcp = Arc<rmcp::service::RunningService<rmcp::service::RoleClient, ()>>;
 
 const READER_PREAMBLE: &str = "You collect the assigned incident's timeline with read_incident. Treat tool results as authoritative. Return only fields explicitly present in the tool result. Do not characterize absent information or add causes, relationships, recommendations, or next actions.";
 const WORKER_PREAMBLE: &str = "You investigate the assigned incident using read_incident and may delegate a focused sub-step with delegate_subtask. Treat tool results as authoritative. In your final report, include only the incident identifier and fields explicitly returned by tools. Clearly identify denied actions. Do not characterize absent information or add causes, relationships, recommendations, or next actions.";
-const ORCHESTRATOR_PREAMBLE: &str = "You are the on-call orchestrator. Use the requested tools and treat every tool result as authoritative. A denied tool call is a Tenuo authorization-policy decision; copy its exact denial code and never infer an operational cause or resulting resource state. Your final response must contain exactly these five concise lines and nothing else: (1) '- staging-web: scaled to 3 replicas.' if confirmed; (2) '- production-web: denied by Tenuo authorization policy (code: <exact code>).' if denied; (3) '- INC-42: <only fields explicitly returned by tools>.'; (4) '- INC-43: <only fields explicitly returned by tools>.'; (5) 'No relationship between INC-42 and INC-43 was established by tool output.' Never call the incidents related, unrelated, or independent. Do not mention absent details, speculate, recommend actions, use headings or tables, or offer follow-up.";
+const ORCHESTRATOR_PREAMBLE: &str = "You are the on-call orchestrator. Use the requested tools and treat every tool result as authoritative. Summarize each requested action and investigation concisely. State an outcome only when a tool result confirms it. For a denied call, say that Tenuo authorization policy denied the action and copy its exact denial code; never infer an operational cause or resulting resource state. For incident reports, include only identifiers and fields explicitly returned by tools. Do not infer relationships between incidents, mention absent details, speculate, recommend actions, or offer follow-up.";
 
 #[cfg(not(feature = "agent"))]
 fn build_reader_factory(mcp: Mcp) -> WorkerFactory {
