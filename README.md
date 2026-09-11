@@ -1,24 +1,23 @@
-# Tenuo + Rig: delegated authorization over MCP
+# Tenuo authorization for Rig agents and MCP tools
 
-This repository answers one integration question: **can a Rust agent orchestrator delegate narrowly scoped authority across a Rig agent graph and have the final MCP service verify that authority for itself?**
+This example shows how to add [Tenuo](https://tenuo.ai) authorization to a Rust agent system built with [Rig](https://rig.rs) and [MCP](https://modelcontextprotocol.io).
 
-Yes. The demo runs an on-call orchestrator, two parallel worker agents, a nested reader agent, and a separate MCP server. Every registered tool call is authorized by a [Tenuo](https://tenuo.ai) warrant. Delegated authority can only shrink, and the MCP server verifies the chain, holder proof, and exact arguments before its handler runs.
+An on-call orchestrator delegates work to two parallel agents, and one worker delegates a narrower task to a reader agent. Each agent receives its own key and scoped warrant. Delegated authority can only shrink. Incident reads cross an MCP process boundary, where the server verifies the warrant chain, holder proof, and exact call arguments before running the handler.
 
-The integration uses standard [Rig](https://rig.rs) and [MCP](https://modelcontextprotocol.io) APIs: ordinary `Tool` implementations, `ToolContext`, `agent.prompt()`, Rig concurrency, the `rmcp` client, and an `rmcp` server over a child-process transport.
+The integration uses standard Rig and MCP APIs: ordinary `Tool` implementations, `ToolContext`, `agent.prompt()`, Rig concurrency, the `rmcp` client, and an `rmcp` server over a child-process transport.
 
-## Scope at a glance
+## What the example includes
 
-| Area | What this repository demonstrates | Status in this demo |
+| Component | Demonstrated behavior | Implementation |
 |---|---|---|
-| Rig orchestration | Real agent loop, tool dispatch, parallel workers, nested agent-as-tool delegation | Real |
-| Tenuo authorization | Argument constraints, holder-bound warrants, narrowing delegation, depth and expiry limits | Real |
-| MCP enforcement | Per-call proof in `_meta.tenuo`, independently verified before the operation | Real, separate child process |
-| Issuance control plane | Root authority mints the orchestrator warrant | In-process stand-in |
-| Business operations | Cluster scaling and incident reads | Safe example handlers, not external systems |
-| Model | Deterministic scripted completion by default; OpenAI available behind a feature | Scripted by default |
-| Production operations | KMS/HSM keys, durable revocation, replay deduplication, deployment and observability | Deliberately out of scope |
+| Rig orchestration | Agent loop, tool dispatch, parallel workers, and nested agent-as-tool delegation | Working integration |
+| Tenuo authorization | Argument constraints, holder-bound warrants, narrowing delegation, depth limits, and expiry | Working integration |
+| MCP enforcement | Per-call authorization in `_meta.tenuo`, verified before the operation | Separate child process |
+| Issuance | Root authority mints the orchestrator warrant | In-process demo issuer |
+| Operations | Cluster scaling and incident reads | Example handlers with no external side effects |
+| Model | Deterministic scripted completion by default, with optional OpenAI completions | Selectable at build time |
 
-This is an executable integration proof, not a production adapter crate. It shows the authorization and delegation boundaries a production adapter must preserve. The [security and production notes](#security-boundaries-and-production-notes) make the remaining work explicit.
+The repository is an executable integration example rather than a reusable adapter crate. The [production considerations](#production-considerations) describe how the demo setup maps to a deployed system.
 
 ## What is Tenuo
 
@@ -32,7 +31,7 @@ Prerequisites: a stable Rust toolchain and Linux or macOS. No API key is needed 
 cargo build --locked --bins && cargo run --locked --bin demo
 ```
 
-The default build uses scripted completion models, the same pattern Rig uses for its own credential-free examples. The real agent loop still runs: the model selects tools, Rig dispatches them, denials return as tool results, and the model reports them. This makes the security flow deterministic and reviewable.
+The default build uses scripted completion models, the same pattern Rig uses for its own credential-free examples. The normal agent loop still runs: the model selects tools, Rig dispatches them, denials return as tool results, and the model reports them. The scripted path keeps the example deterministic and requires no external credentials.
 
 To run the same agents with OpenAI-backed completions:
 
@@ -50,15 +49,14 @@ cargo test --locked --all-targets
 
 The tests execute the complete scripted flow and assert the Rig argument denials, peer isolation, non-widening delegation, independent MCP verification, and server-side rejection of bypass attempts.
 
-## Suggested review path
+## Code walkthrough
 
-For a focused technical evaluation:
-
-1. Run the default demo and compare its decisions with [What each scene shows](#what-each-scene-shows).
-2. Review [`src/main.rs`](src/main.rs) for the Rig agent graph and process setup.
-3. Review [`src/tools/delegate_incident.rs`](src/tools/delegate_incident.rs) and [`src/tools/delegate_subtask.rs`](src/tools/delegate_subtask.rs) for the two delegation hops.
-4. Review [`src/tools/incident_mcp.rs`](src/tools/incident_mcp.rs) and [`src/bin/incident_mcp_server.rs`](src/bin/incident_mcp_server.rs) together to see proof construction on the caller and independent verification at the MCP boundary.
-5. Run the end-to-end tests, then map the example capabilities and constraints to your own tools and resource identifiers.
+1. [`src/main.rs`](src/main.rs) assembles the Rig agent graph, creates the orchestrator authority, and starts the MCP server process.
+2. [`src/tools/delegate_incident.rs`](src/tools/delegate_incident.rs) gives each worker authority for one incident.
+3. [`src/tools/delegate_subtask.rs`](src/tools/delegate_subtask.rs) creates the terminal reader delegation and demonstrates that a worker cannot widen its scope.
+4. [`src/tools/incident_mcp.rs`](src/tools/incident_mcp.rs) constructs per-call MCP authorization after Rig has selected the tool arguments.
+5. [`src/bin/incident_mcp_server.rs`](src/bin/incident_mcp_server.rs) reconstructs the received call and verifies it before handling the incident read.
+6. [`tests/demo_boundaries.rs`](tests/demo_boundaries.rs) runs the complete flow and asserts the authorization boundaries shown in the transcript.
 
 ## What you'll see
 
@@ -98,7 +96,7 @@ For a focused technical evaluation:
 
 ## Tenuo in Rig terms
 
-If you know Rig, four ideas cover everything in this repo.
+Four concepts connect Tenuo to Rig in this example.
 
 - **A warrant** is a signed grant: which tools may be called, what argument values are allowed (a `Pattern` on `cluster`, a `Range` on `replicas`), and when it expires. It is bound to a public key. Whoever calls with it must sign each call with the matching private key, so copying the warrant alone is insufficient.
 - **A guard** checks one call against a warrant. In this repo the guard runs as the first thing inside `Tool::call()`, through one helper, `guarded()` in `src/authority.rs`. The warrant and the key travel in Rig's `ToolContext`, inserted once per run, so every dispatch path Rig has goes through the check.
@@ -110,7 +108,7 @@ If you know Rig, four ideas cover everything in this repo.
 Authority enters at the top and can only shrink on the way down. Every box holds its own key. Every `read_incident` call, from any level, goes to the MCP server at the bottom, which verifies it with nothing but the root public key.
 
 ```text
-  CONTROL PLANE STAND-IN                  holds the ROOT private key
+  DEMO ISSUER                             holds the ROOT private key
   (same demo process; separate service in production)
   mints one warrant for the orchestrator
       │
@@ -155,9 +153,9 @@ How authority shrinks at each hop:
 | may delegate | yes | yes | once more | no |
 | chain depth | 0 | 1 | 2 | 3 |
 
-The design has three trust positions. The issuer holds the root private key and mints warrants. An agent process should hold only its own key and warrant. An enforcement point needs only the trusted root public key.
+The design has three trust positions. The issuer holds the root private key and mints warrants. An agent process holds its own key and warrant. An enforcement point needs only the trusted root public key.
 
-This executable fully realizes the MCP boundary: the MCP server is a separate child process and receives only the root public key. It does **not** fully realize the issuer boundary: `src/issuer.rs` and the agents run in the same parent process so the demo can start with one command. A Rust module is not a security boundary. Production issuance should run in a separate control-plane service and protect signing keys with an appropriate secrets manager, KMS, or HSM.
+The MCP server runs as a separate child process and receives only the root public key. To keep the example runnable with one command, the demo issuer and agents share the parent process. A production deployment should run issuance as a separate control-plane service and protect its signing keys with an appropriate secrets manager, KMS, or HSM.
 
 ## What each scene shows
 
@@ -168,7 +166,7 @@ This executable fully realizes the MCP boundary: the MCP server is a separate ch
 
 The nested agents use the agent-as-tool pattern with one deliberate difference from `Agent::into_tool()`: that method forwards the parent's `ToolContext`, which would hand a worker the orchestrator's full authority. `delegate_incident` and `delegate_subtask` build a fresh context holding only the narrower chain.
 
-## Carrying the proof to the MCP server
+## Carrying authorization to the MCP server
 
 `src/tools/incident_mcp.rs` is a Rig `Tool` that drives the `rmcp` client directly. It runs the guard first; only an allowed call produces the `_meta.tenuo` envelope, which it sets on `CallToolRequestParams`. The server side is a standard `rmcp` server (`src/bin/incident_mcp_server.rs`) that reads `_meta`, verifies the chain, proof, and arguments, and only then runs the operation.
 
@@ -176,38 +174,38 @@ The nested agents use the agent-as-tool pattern with one deliberate difference f
 
 Rig 0.42 already forwards an `rmcp::model::Meta` from `ToolContext` as `_meta`, which covers bearer tokens and session ids. That value is read from the run's context before the model chooses arguments. Tenuo's signature covers the exact arguments, so it can only be produced after the model chooses them. Support for per-call `_meta` derived from the chosen call is tracked upstream in [rig#2442](https://github.com/0xPlaygrounds/rig/issues/2442).
 
-## Security boundaries and production notes
+## Production considerations
 
-This demo deliberately keeps operational setup small. A production integration should preserve these distinctions:
+The example prioritizes a small, one-command setup. A production integration should account for the following:
 
-- **Issuer isolation is simulated.** Move the root signing key out of the agent process. The in-process `ControlPlane` exists only to make the demo self-contained.
-- **MCP enforcement is real.** The child MCP process receives the root public key, reconstitutes the call from received arguments, and verifies independently before executing the handler.
-- **The client guard is not the remote trust boundary.** Client-side denial saves a network call and avoids releasing an envelope. Server verification remains mandatory because callers can bypass or compromise the client.
+- **Separate issuance from agents.** Keep the root signing key out of the agent process. The in-process `ControlPlane` is present only to make the example self-contained.
+- **Enforce at the operation boundary.** The MCP process receives the root public key, reconstructs the call from received arguments, and verifies independently before executing the handler.
+- **Do not rely on the client guard as the remote trust boundary.** Client-side denial saves a network call and avoids releasing an envelope. Server verification remains mandatory because callers can bypass or compromise the client.
 - **Holder compromise remains bounded, not harmless.** An attacker with both a warrant chain and its holder key can make valid calls within that warrant. Narrow constraints, short lifetimes, delegation depth limits, revocation, and server enforcement bound the damage.
-- **TTL-only revocation is a demo choice.** Production deployments that require invalidation before expiry should configure a fail-closed revocation source and define its freshness and outage behavior.
-- **Exact replay needs application-level deduplication.** The current proof scheme is stateless: a captured valid request can be replayed unchanged within its short proof window. Non-idempotent handlers should atomically claim `Warrant::dedup_key(tool, args)` in a shared store before performing the action and retain it for at least `Warrant::dedup_ttl_secs()`.
+- **Configure revocation for the deployment.** This example uses TTL-only revocation. Systems that require invalidation before expiry should configure a fail-closed revocation source and define its freshness and outage behavior.
+- **Add application-level deduplication where exact replay matters.** The current proof scheme is stateless: a captured valid request can be replayed unchanged within its short proof window. Non-idempotent handlers should atomically claim `Warrant::dedup_key(tool, args)` in a shared store before performing the action and retain it for at least `Warrant::dedup_ttl_secs()`.
 - **Logs and errors need a disclosure policy.** The transcript prints full arguments and some internal error details for teaching value. Production code should redact arguments by default, expose stable denial codes to callers, and keep diagnostic causes in protected logs.
 - **Use one canonical argument view.** The values checked, signed, transmitted, and reconstructed by the verifier must be semantically identical. A production adapter should construct the outbound arguments and authorization metadata together and fail closed on serialization errors.
-- **Key storage is application-owned.** Generated in-memory keys are appropriate for this short-lived run. Long-running services should use explicit holder-key lifecycle, tenant isolation, rotation, and secure storage.
+- **Manage holder-key lifecycle explicitly.** Generated in-memory keys are appropriate for this short-lived run. Long-running services should define holder-key storage, tenant isolation, rotation, and destruction.
 
 Tenuo authorizes actions; it does not sandbox agent code, isolate processes, authenticate users, or replace the surrounding IAM system.
 
-## Design-partner discussion
+## Adapting the example
 
-The demo is intentionally small enough to adapt. The most useful inputs for a production integration design are:
+Adapting the example to another system requires a few application and deployment choices:
 
-- where root issuance and holder keys should live in your architecture;
+- where root issuance and holder keys should live;
 - whether MCP calls are local child processes, remote services, or both;
 - which agent-to-agent handoffs need independently constrained authority;
 - which tool arguments identify tenant, environment, resource, or operation scope;
 - required warrant lifetime, revocation freshness, replay handling, and audit evidence;
-- how the adapter should fit your deployment model, including containers and Kubernetes.
+- how the integration should run across processes, containers, or Kubernetes workloads.
 
-Those choices determine the production adapter surface; they do not change the delegation and verification model shown here.
+These choices determine the integration surface without changing the delegation and verification model shown here.
 
 ## Layout
 
-- [`src/issuer.rs`](src/issuer.rs): the control-plane stand-in. Root key, warrant minting.
+- [`src/issuer.rs`](src/issuer.rs): the in-process demo issuer. Root key and warrant minting.
 - [`src/authority.rs`](src/authority.rs): `RunAuthority`, carried in `ToolContext`, and `guarded()`, the helper every tool calls.
 - [`src/models.rs`](src/models.rs): scripted `CompletionModel`s for the credential-free path.
 - [`src/tools/scale_cluster.rs`](src/tools/scale_cluster.rs): a local Rig tool.
