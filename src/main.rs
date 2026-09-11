@@ -451,9 +451,10 @@ impl LiveProvider {
                 let key = std::env::var("ANTHROPIC_API_KEY").map_err(|_| {
                     anyhow::anyhow!("ANTHROPIC_API_KEY is required for LLM_PROVIDER=anthropic")
                 })?;
-                let model = std::env::var("ANTHROPIC_MODEL").unwrap_or_else(|_| {
-                    rig::providers::anthropic::completion::CLAUDE_SONNET_4_6.into()
-                });
+                // Rig 0.42's Anthropic constants predate the Claude 5 family, so the
+                // default is a plain model id. Override with ANTHROPIC_MODEL.
+                let model =
+                    std::env::var("ANTHROPIC_MODEL").unwrap_or_else(|_| "claude-opus-5".into());
                 let builder = rig::providers::anthropic::Client::builder().api_key(key);
                 let builder = if let Ok(workspace_id) = std::env::var("ANTHROPIC_WORKSPACE_ID") {
                     let mut headers = http::HeaderMap::new();

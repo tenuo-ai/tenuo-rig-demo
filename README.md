@@ -6,7 +6,7 @@ An on-call orchestrator delegates work to two parallel agents, and one worker de
 
 The integration uses standard Rig and MCP APIs: ordinary `Tool` implementations, `ToolContext`, `agent.prompt()`, Rig concurrency, the `rmcp` client, and an `rmcp` server over a child-process transport.
 
-The Rig-facing integration is deliberately small: one `guarded()` helper reads authority from `ToolContext`, and every tool follows one convention—call the guard before doing work. The remaining code is ordinary application tools and delegation policy.
+The Rig-facing integration is deliberately small: one `guarded()` helper reads authority from `ToolContext`, and every tool follows one convention: call the guard before doing work. The remaining code is ordinary application tools and delegation policy.
 
 ## What the example includes
 
@@ -19,11 +19,20 @@ The Rig-facing integration is deliberately small: one `guarded()` helper reads a
 | Operations | Cluster scaling and incident reads | Example handlers with no external side effects |
 | Model | Deterministic scripted completion by default, with optional OpenAI or Anthropic completions | Scripted or live at build time; live provider selected at runtime |
 
-The repository is an executable integration example rather than a reusable adapter crate. The [production considerations](#production-considerations) describe how the demo setup maps to a deployed system.
+The repository is an executable integration example rather than a reusable adapter crate. See [PRODUCTION.md](PRODUCTION.md) for how the demo setup maps to a deployed system.
 
 ## What is Tenuo
 
 Tenuo gives each task only the authority it needs. That authority is a signed **warrant**: which tools may be called, which argument values are allowed, for how long, and which key may use it. The warrant travels with the request across agents, tools, and processes. When one agent delegates to another, the new warrant can only narrow. Whoever executes the action verifies the warrant locally, with nothing but the issuer's public key. Tenuo sits alongside the identity and policy systems you already run; it answers what this task may do right now.
+
+## Tenuo in Rig terms
+
+Four concepts connect Tenuo to Rig in this example.
+
+- **A warrant** is a signed grant: which tools may be called, what argument values are allowed (a `Pattern` on `cluster`, a `Range` on `replicas`), and when it expires. It is bound to a public key. Whoever calls with it must sign each call with the matching private key, so copying the warrant alone is insufficient.
+- **A guard** checks one call against a warrant. In this repo the guard runs as the first thing inside `Tool::call()`, through one helper, `guarded()` in `src/authority.rs`. The warrant and the key travel in Rig's `ToolContext`, inserted once per run, so every dispatch path Rig has goes through the check.
+- **Delegation** mints a narrower warrant for another agent, signed by the current one. The new warrant can drop tools, tighten constraints, and shorten expiry. It cannot add anything, and the core library refuses the mint if it tries. The list of warrants from the root down is the **chain**; a verifier walks all of it.
+- **The MCP server verifies independently.** The client sends its chain and its per-call signature in the request's `_meta`. The server holds only the root public key and checks the chain, the signature, and the argument constraints before the handler runs.
 
 ## Run it
 
@@ -116,15 +125,6 @@ The tests execute the complete scripted flow and assert Rig argument denials, mo
 
 `[tenuo]` lines come from the check inside each tool. `[mcp-server]` lines come from the server process verifying for itself. The two workers' lines interleave because they ran concurrently. Every `holder=` value is a different key. The argument values are printed to make the demo legible; production logging should emit decision metadata and redacted summaries instead of raw tool arguments.
 
-## Tenuo in Rig terms
-
-Four concepts connect Tenuo to Rig in this example.
-
-- **A warrant** is a signed grant: which tools may be called, what argument values are allowed (a `Pattern` on `cluster`, a `Range` on `replicas`), and when it expires. It is bound to a public key. Whoever calls with it must sign each call with the matching private key, so copying the warrant alone is insufficient.
-- **A guard** checks one call against a warrant. In this repo the guard runs as the first thing inside `Tool::call()`, through one helper, `guarded()` in `src/authority.rs`. The warrant and the key travel in Rig's `ToolContext`, inserted once per run, so every dispatch path Rig has goes through the check.
-- **Delegation** mints a narrower warrant for another agent, signed by the current one. The new warrant can drop tools, tighten constraints, and shorten expiry. It cannot add anything, and the core library refuses the mint if it tries. The list of warrants from the root down is the **chain**; a verifier walks all of it.
-- **The MCP server verifies independently.** The client sends its chain and its per-call signature in the request's `_meta`. The server holds only the root public key and checks the chain, the signature, and the argument constraints before the handler runs.
-
 ## Architecture
 
 Authority enters at the top and can only shrink on the way down. Every box holds its own key. Every `read_incident` call, from any level, goes to the MCP server at the bottom, which verifies it with nothing but the root public key.
@@ -198,34 +198,9 @@ The MCP failure shape reflects where validation failed. Missing or malformed aut
 
 Rig 0.42 already forwards an `rmcp::model::Meta` from `ToolContext` as `_meta`, which covers bearer tokens and session ids. That value is read from the run's context before the model chooses arguments. Tenuo's signature covers the normalized arguments, so it can only be produced after the model chooses them. This small custom tool preserves the normal adapter's important call timeout, cancellation, rich-result, and host-metadata behavior, but it does not implement dynamic tool discovery or `tools/list_changed` reconciliation. Support for per-call `_meta` derived from the chosen call is tracked upstream in [rig#2442](https://github.com/0xPlaygrounds/rig/issues/2442).
 
-## Production considerations
+## Production and adaptation
 
-The example prioritizes a small, one-command setup. A production integration should account for the following:
-
-- **Separate issuance from agents.** Keep the root signing key out of the agent process. The in-process `ControlPlane` is present only to make the example self-contained.
-- **Enforce at the operation boundary.** The MCP process receives the root public key, reconstructs the call from received arguments, and verifies independently before executing the handler.
-- **Do not rely on the client guard as the remote trust boundary.** Client-side denial saves a network call and avoids releasing an envelope. Server verification remains mandatory because callers can bypass or compromise the client.
-- **Holder compromise remains bounded, not harmless.** An attacker with both a warrant chain and its holder key can make valid calls within that warrant. Narrow constraints, short lifetimes, delegation depth limits, revocation, and server enforcement bound the damage.
-- **Configure revocation for the deployment.** This example uses TTL-only revocation. Systems that require invalidation before expiry should configure a fail-closed revocation source and define its freshness and outage behavior.
-- **Add application-level deduplication where exact replay matters.** The attacker scene deliberately shows that this stateless, read-only handler accepts a captured valid request again within its short proof window. Non-idempotent handlers should atomically claim `Warrant::dedup_key(tool, args)` in a shared store before performing the action and retain it for at least `Warrant::dedup_ttl_secs()`.
-- **Logs and errors need a disclosure policy.** The transcript prints full arguments and some internal error details for teaching value. Production code should redact arguments by default, expose stable denial codes to callers, and keep diagnostic causes in protected logs.
-- **Use one canonical argument view.** The values checked, signed, transmitted, and reconstructed by the verifier must be semantically identical. The demo serializes once, rejects unknown fields, constructs the outbound arguments and authorization metadata together, and fails closed on serialization errors.
-- **Manage holder-key lifecycle explicitly.** Generated in-memory keys are appropriate for this short-lived run. Long-running services should define holder-key storage, tenant isolation, rotation, and destruction.
-
-Tenuo authorizes actions; it does not sandbox agent code, isolate processes, authenticate users, or replace the surrounding IAM system.
-
-## Adapting the example
-
-Adapting the example to another system requires a few application and deployment choices:
-
-- where root issuance and holder keys should live;
-- whether MCP calls are local child processes, remote services, or both;
-- which agent-to-agent handoffs need independently constrained authority;
-- which tool arguments identify tenant, environment, resource, or operation scope;
-- required warrant lifetime, revocation freshness, replay handling, and audit evidence;
-- how the integration should run across processes, containers, or Kubernetes workloads.
-
-These choices determine the integration surface without changing the delegation and verification model shown here.
+The demo keeps issuance, agents, and enforcement runnable in one command. [PRODUCTION.md](PRODUCTION.md) covers what changes in a deployed system: separate issuance, fail-closed revocation, replay deduplication, log disclosure, holder-key lifecycle, and the choices involved in adapting the example to another system.
 
 ## Layout
 
@@ -238,4 +213,5 @@ These choices determine the integration surface without changing the delegation 
 - [`src/tools/incident_mcp.rs`](src/tools/incident_mcp.rs): the Rig tool that calls the MCP server with namespaced authorization metadata.
 - [`src/bin/incident_mcp_server.rs`](src/bin/incident_mcp_server.rs): the MCP server.
 - [`tests/demo_boundaries.rs`](tests/demo_boundaries.rs): end-to-end assertions over the scripted Rig and MCP flow.
+- [`PRODUCTION.md`](PRODUCTION.md): production considerations and the choices involved in adapting the example.
 - [`.github/workflows/ci.yml`](.github/workflows/ci.yml): formatting, strict Clippy, locked builds, tests, optional agent compilation, and a scripted demo smoke run.
