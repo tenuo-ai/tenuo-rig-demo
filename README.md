@@ -1,8 +1,24 @@
-# Tenuo + Rig demo
+# Tenuo + Rig: delegated authorization over MCP
 
-A [Rig](https://rig.rs) agent system where every registered tool call is authorized by a [Tenuo](https://tenuo.ai) warrant: an on-call orchestrator, two worker agents it delegates to in parallel, a reader agent one worker delegates to in turn, and an [MCP](https://modelcontextprotocol.io) server that verifies each call for itself. Everything is standard Rig: ordinary `Tool` impls, `ToolContext`, `agent.prompt()`, and the `rmcp` client.
+This repository answers one integration question: **can a Rust agent orchestrator delegate narrowly scoped authority across a Rig agent graph and have the final MCP service verify that authority for itself?**
 
-This repository is an executable integration demo, not a production adapter crate. It demonstrates the authorization and delegation boundaries that an adapter must preserve; the [Security boundaries and production notes](#security-boundaries-and-production-notes) section identifies the boundaries that are simulated for a one-command example.
+Yes. The demo runs an on-call orchestrator, two parallel worker agents, a nested reader agent, and a separate MCP server. Every registered tool call is authorized by a [Tenuo](https://tenuo.ai) warrant. Delegated authority can only shrink, and the MCP server verifies the chain, holder proof, and exact arguments before its handler runs.
+
+The integration uses standard [Rig](https://rig.rs) and [MCP](https://modelcontextprotocol.io) APIs: ordinary `Tool` implementations, `ToolContext`, `agent.prompt()`, Rig concurrency, the `rmcp` client, and an `rmcp` server over a child-process transport.
+
+## Scope at a glance
+
+| Area | What this repository demonstrates | Status in this demo |
+|---|---|---|
+| Rig orchestration | Real agent loop, tool dispatch, parallel workers, nested agent-as-tool delegation | Real |
+| Tenuo authorization | Argument constraints, holder-bound warrants, narrowing delegation, depth and expiry limits | Real |
+| MCP enforcement | Per-call proof in `_meta.tenuo`, independently verified before the operation | Real, separate child process |
+| Issuance control plane | Root authority mints the orchestrator warrant | In-process stand-in |
+| Business operations | Cluster scaling and incident reads | Safe example handlers, not external systems |
+| Model | Deterministic scripted completion by default; OpenAI available behind a feature | Scripted by default |
+| Production operations | KMS/HSM keys, durable revocation, replay deduplication, deployment and observability | Deliberately out of scope |
+
+This is an executable integration proof, not a production adapter crate. It shows the authorization and delegation boundaries a production adapter must preserve. The [security and production notes](#security-boundaries-and-production-notes) make the remaining work explicit.
 
 ## What is Tenuo
 
@@ -10,14 +26,18 @@ Tenuo gives each task only the authority it needs. That authority is a signed **
 
 ## Run it
 
+Prerequisites: a stable Rust toolchain and Linux or macOS. No API key is needed for the default path.
+
 ```bash
-cargo build --bins && cargo run --bin demo
+cargo build --locked --bins && cargo run --locked --bin demo
 ```
 
-No API key needed. The default build uses scripted completion models, the same pattern Rig uses for its own credential-free examples. The real agent loop runs: the model picks tools, Rig dispatches them, denials come back to the model as tool results, and the model reports them. To run the same agents on OpenAI:
+The default build uses scripted completion models, the same pattern Rig uses for its own credential-free examples. The real agent loop still runs: the model selects tools, Rig dispatches them, denials return as tool results, and the model reports them. This makes the security flow deterministic and reviewable.
+
+To run the same agents with OpenAI-backed completions:
 
 ```bash
-cargo build --bins && OPENAI_API_KEY=... cargo run --features agent --bin demo
+cargo build --locked --bins && OPENAI_API_KEY=... cargo run --locked --features agent --bin demo
 ```
 
 Depends on `tenuo` 0.2.4 from crates.io and `rig` 0.42.
@@ -29,6 +49,16 @@ cargo test --locked --all-targets
 ```
 
 The tests execute the complete scripted flow and assert the Rig argument denials, peer isolation, non-widening delegation, independent MCP verification, and server-side rejection of bypass attempts.
+
+## Suggested review path
+
+For a focused technical evaluation:
+
+1. Run the default demo and compare its decisions with [What each scene shows](#what-each-scene-shows).
+2. Review [`src/main.rs`](src/main.rs) for the Rig agent graph and process setup.
+3. Review [`src/tools/delegate_incident.rs`](src/tools/delegate_incident.rs) and [`src/tools/delegate_subtask.rs`](src/tools/delegate_subtask.rs) for the two delegation hops.
+4. Review [`src/tools/incident_mcp.rs`](src/tools/incident_mcp.rs) and [`src/bin/incident_mcp_server.rs`](src/bin/incident_mcp_server.rs) together to see proof construction on the caller and independent verification at the MCP boundary.
+5. Run the end-to-end tests, then map the example capabilities and constraints to your own tools and resource identifiers.
 
 ## What you'll see
 
@@ -162,15 +192,28 @@ This demo deliberately keeps operational setup small. A production integration s
 
 Tenuo authorizes actions; it does not sandbox agent code, isolate processes, authenticate users, or replace the surrounding IAM system.
 
+## Design-partner discussion
+
+The demo is intentionally small enough to adapt. The most useful inputs for a production integration design are:
+
+- where root issuance and holder keys should live in your architecture;
+- whether MCP calls are local child processes, remote services, or both;
+- which agent-to-agent handoffs need independently constrained authority;
+- which tool arguments identify tenant, environment, resource, or operation scope;
+- required warrant lifetime, revocation freshness, replay handling, and audit evidence;
+- how the adapter should fit your deployment model, including containers and Kubernetes.
+
+Those choices determine the production adapter surface; they do not change the delegation and verification model shown here.
+
 ## Layout
 
-- `src/issuer.rs`: the control-plane stand-in. Root key, warrant minting.
-- `src/authority.rs`: `RunAuthority`, carried in `ToolContext`, and `guarded()`, the helper every tool calls.
-- `src/models.rs`: scripted `CompletionModel`s for the credential-free path.
-- `src/tools/scale_cluster.rs`: a local Rig tool.
-- `src/tools/delegate_incident.rs`: the agent-as-tool that mints a worker's chain and runs a fresh worker agent.
-- `src/tools/delegate_subtask.rs`: the second hop. A worker mints a terminal reader chain, or is refused when it asks for more than it holds.
-- `src/tools/incident_mcp.rs`: the Rig tool that calls the MCP server with `_meta.tenuo`.
-- `src/bin/incident_mcp_server.rs`: the MCP server.
-- `tests/demo_boundaries.rs`: end-to-end assertions over the scripted Rig and MCP flow.
-- `.github/workflows/ci.yml`: formatting, locked builds, tests, optional agent compilation, and a scripted demo smoke run.
+- [`src/issuer.rs`](src/issuer.rs): the control-plane stand-in. Root key, warrant minting.
+- [`src/authority.rs`](src/authority.rs): `RunAuthority`, carried in `ToolContext`, and `guarded()`, the helper every tool calls.
+- [`src/models.rs`](src/models.rs): scripted `CompletionModel`s for the credential-free path.
+- [`src/tools/scale_cluster.rs`](src/tools/scale_cluster.rs): a local Rig tool.
+- [`src/tools/delegate_incident.rs`](src/tools/delegate_incident.rs): the agent-as-tool that mints a worker's chain and runs a fresh worker agent.
+- [`src/tools/delegate_subtask.rs`](src/tools/delegate_subtask.rs): the second hop. A worker mints a terminal reader chain, or is refused when it asks for more than it holds.
+- [`src/tools/incident_mcp.rs`](src/tools/incident_mcp.rs): the Rig tool that calls the MCP server with `_meta.tenuo`.
+- [`src/bin/incident_mcp_server.rs`](src/bin/incident_mcp_server.rs): the MCP server.
+- [`tests/demo_boundaries.rs`](tests/demo_boundaries.rs): end-to-end assertions over the scripted Rig and MCP flow.
+- [`.github/workflows/ci.yml`](.github/workflows/ci.yml): formatting, locked builds, tests, optional agent compilation, and a scripted demo smoke run.
