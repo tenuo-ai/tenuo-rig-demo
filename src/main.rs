@@ -399,8 +399,21 @@ impl LiveProvider {
                 let model = std::env::var("ANTHROPIC_MODEL").unwrap_or_else(|_| {
                     rig::providers::anthropic::completion::CLAUDE_SONNET_4_6.into()
                 });
+                let builder = rig::providers::anthropic::Client::builder().api_key(key);
+                let builder = if let Ok(workspace_id) = std::env::var("ANTHROPIC_WORKSPACE_ID") {
+                    let mut headers = http::HeaderMap::new();
+                    headers.insert(
+                        "anthropic-workspace-id",
+                        workspace_id.parse().map_err(|_| {
+                            anyhow::anyhow!("ANTHROPIC_WORKSPACE_ID is not a valid header value")
+                        })?,
+                    );
+                    builder.http_headers(headers)
+                } else {
+                    builder
+                };
                 Ok(Self::Anthropic {
-                    client: rig::providers::anthropic::Client::new(key)?,
+                    client: builder.build()?,
                     model,
                 })
             }

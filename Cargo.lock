@@ -6624,6 +6624,7 @@ dependencies = [
  "anyhow",
  "futures",
  "hex",
+ "http",
  "rig",
  "rmcp",
  "schemars 1.2.2",

@@ -16,6 +16,7 @@ schemars = "1"
 anyhow = "1"
 futures = "0.3"
 hex = "0.4"
+http = "1"
 
 [features]
 # Real Rig agent loop. Select OpenAI or Anthropic at run time.
