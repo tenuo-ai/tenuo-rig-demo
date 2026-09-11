@@ -87,6 +87,9 @@ impl IncidentServer {
                     ))]));
                 }
                 GuardError::Operation(never) => match never {},
+                other => {
+                    return Err(McpError::internal_error(other.to_string(), None));
+                }
             },
         };
 
