@@ -11,7 +11,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use rig::prelude::*;
-use rig::tool::{Tool, ToolContext};
+use rig::tool::{Tool, ToolContext, ToolExecutionError};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -23,6 +23,7 @@ use crate::authority::{guarded, RunAuthority, ToolError};
 pub type WorkerFactory = Arc<dyn Fn(&str) -> Agent + Send + Sync>;
 
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct DelegateArgs {
     /// Incident the worker may investigate, e.g. "INC-42".
     pub incident_id: String,
@@ -46,8 +47,13 @@ impl Tool for DelegateIncident {
         json!({
             "type": "object",
             "properties": { "incident_id": { "type": "string" } },
-            "required": ["incident_id"]
+            "required": ["incident_id"],
+            "additionalProperties": false
         })
+    }
+
+    fn map_error(&self, error: Self::Error) -> ToolExecutionError {
+        error.into_execution_error()
     }
 
     async fn call(

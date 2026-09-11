@@ -42,6 +42,14 @@ fn rig_dispatch_enforces_argument_constraints() {
 }
 
 #[test]
+fn scripted_model_reports_the_actual_model_visible_denial() {
+    let output = demo_output();
+    assert!(output.stdout.contains(
+        "orchestrator: Staging scale succeeded. Production scale was denied: denied (constraint-violation): Constraint not satisfied."
+    ));
+}
+
+#[test]
 fn delegated_workers_are_isolated_and_cannot_widen_authority() {
     let output = demo_output();
     assert!(output.stdout.contains(
@@ -74,12 +82,15 @@ fn mcp_server_rejects_client_bypass_attempts() {
     assert!(output
         .stderr
         .contains("[mcp-server] denied   read_incident INC-99"));
+    assert!(output.stdout.contains(
+        "server: returned a tool-level denial for a validly signed call outside the warrant"
+    ));
     assert!(output
         .stdout
-        .contains("server: denied a validly signed call outside the warrant"));
+        .contains("server: rejected a proof signed for different arguments"));
     assert!(output
         .stderr
-        .contains("[mcp-server] refused  read_incident INC-42: no _meta.tenuo"));
+        .contains("[mcp-server] refused  read_incident INC-42: no authorization metadata"));
     assert!(output
         .stdout
         .contains("server: refused a call with no warrant at all"));
