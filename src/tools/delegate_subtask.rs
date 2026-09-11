@@ -57,8 +57,15 @@ impl Tool for DelegateSubtask {
         })
     }
 
-    async fn call(&self, ctx: &mut ToolContext, args: Self::Args) -> Result<Self::Output, Self::Error> {
-        let parent = ctx.get::<RunAuthority>().cloned().ok_or(ToolError::NoAuthority)?;
+    async fn call(
+        &self,
+        ctx: &mut ToolContext,
+        args: Self::Args,
+    ) -> Result<Self::Output, Self::Error> {
+        let parent = ctx
+            .get::<RunAuthority>()
+            .cloned()
+            .ok_or(ToolError::NoAuthority)?;
         guarded(ctx, Self::NAME, &args, |_| Ok(()))?;
 
         let id = args.incident_id.as_str();
@@ -75,8 +82,14 @@ impl Tool for DelegateSubtask {
         let grandchild = match parent.guard.delegate(&parent.authority, &profile) {
             Ok(g) => g,
             Err(e) => {
-                println!("      [tenuo] refuse {:<14} mint for scope={}: {e}", parent.agent, args.scope);
-                return Err(ToolError::Denied { code: "attenuation".into(), message: e.to_string() });
+                println!(
+                    "      [tenuo] refuse {:<14} mint for scope={}: {e}",
+                    parent.agent, args.scope
+                );
+                return Err(ToolError::Denied {
+                    code: "attenuation".into(),
+                    message: e.to_string(),
+                });
             }
         };
         let label = format!("reader[{id}]");
@@ -86,7 +99,11 @@ impl Tool for DelegateSubtask {
             grandchild.holder().fingerprint(),
             grandchild.chain().len()
         );
-        let authority = RunAuthority { guard: parent.guard.clone(), authority: Arc::new(grandchild), agent: label };
+        let authority = RunAuthority {
+            guard: parent.guard.clone(),
+            authority: Arc::new(grandchild),
+            agent: label,
+        };
 
         let reader = (self.reader_factory)(id);
         reader

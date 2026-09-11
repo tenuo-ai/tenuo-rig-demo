@@ -49,10 +49,15 @@ impl Tool for RemoteReadIncident {
         })
     }
 
-    async fn call(&self, ctx: &mut ToolContext, args: Self::Args) -> Result<Self::Output, Self::Error> {
+    async fn call(
+        &self,
+        ctx: &mut ToolContext,
+        args: Self::Args,
+    ) -> Result<Self::Output, Self::Error> {
         // The closure only builds the envelope. No allow, no envelope.
         let envelope = guarded(ctx, Self::NAME, &args, |authorized| {
-            encode_meta_from_authorized(authorized).map_err(|e| ToolError::Operation(format!("{e:?}")))
+            encode_meta_from_authorized(authorized)
+                .map_err(|e| ToolError::Operation(format!("{e:?}")))
         })?;
 
         let mut meta = RequestMetaObject::new();
@@ -64,7 +69,11 @@ impl Tool for RemoteReadIncident {
         let mut params = CallToolRequestParams::new(Self::NAME).with_arguments(arguments);
         params.meta = Some(meta);
 
-        let result = self.client.call_tool(params).await.map_err(|e| ToolError::Operation(e.to_string()))?;
+        let result = self
+            .client
+            .call_tool(params)
+            .await
+            .map_err(|e| ToolError::Operation(e.to_string()))?;
         let text = result
             .content
             .iter()
@@ -72,7 +81,10 @@ impl Tool for RemoteReadIncident {
             .collect::<Vec<_>>()
             .join("\n");
         if result.is_error.unwrap_or(false) {
-            return Err(ToolError::Denied { code: "server".into(), message: text });
+            return Err(ToolError::Denied {
+                code: "server".into(),
+                message: text,
+            });
         }
         Ok(text)
     }

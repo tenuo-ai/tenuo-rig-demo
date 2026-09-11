@@ -29,7 +29,9 @@ pub struct IncidentServer {
 #[tool_router]
 impl IncidentServer {
     pub fn new(guard: Guard) -> Self {
-        Self { guard: std::sync::Arc::new(guard) }
+        Self {
+            guard: std::sync::Arc::new(guard),
+        }
     }
 
     #[tool(description = "Read an incident record from the security system of record.")]
@@ -40,7 +42,10 @@ impl IncidentServer {
     ) -> Result<String, McpError> {
         // 1. Pull the Tenuo envelope out of _meta. Missing means deny.
         let tenuo = ctx.meta.get("tenuo").cloned().ok_or_else(|| {
-            eprintln!("      [mcp-server] refused  read_incident {}: no _meta.tenuo", args.incident_id);
+            eprintln!(
+                "      [mcp-server] refused  read_incident {}: no _meta.tenuo",
+                args.incident_id
+            );
             McpError::invalid_params("missing _meta.tenuo", None)
         })?;
         let received = decode_meta(&tenuo)
@@ -84,7 +89,8 @@ impl ServerHandler for IncidentServer {
     fn get_info(&self) -> ServerInfo {
         let mut info = ServerInfo::default();
         info.capabilities = ServerCapabilities::builder().enable_tools().build();
-        info.instructions = Some("Incident records. Every call must carry a Tenuo warrant in _meta.tenuo.".into());
+        info.instructions =
+            Some("Incident records. Every call must carry a Tenuo warrant in _meta.tenuo.".into());
         info
     }
 }
@@ -94,15 +100,24 @@ async fn main() -> anyhow::Result<()> {
     let root_hex = std::env::var("TENUO_ROOT_PUBLIC_KEY")
         .map_err(|_| anyhow::anyhow!("TENUO_ROOT_PUBLIC_KEY (hex) is required"))?;
     let bytes = hex::decode(&root_hex)?;
-    let arr: [u8; 32] = bytes.as_slice().try_into().map_err(|_| anyhow::anyhow!("root key must be 32 bytes"))?;
+    let arr: [u8; 32] = bytes
+        .as_slice()
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("root key must be 32 bytes"))?;
     let root = PublicKey::from_bytes(&arr)?;
 
     let guard = Tenuo::enforcement()
         .trusted_root(root)
-        .revocation(RevocationMode::TtlOnly { max_lifetime: Duration::from_secs(3600) })
+        .revocation(RevocationMode::TtlOnly {
+            max_lifetime: Duration::from_secs(3600),
+        })
+        // The handler emits the customer-facing MCP verification transcript.
+        .denial_reporting(DenialReporting::Debug)
         .build()?;
 
-    let service = IncidentServer::new(guard).serve(rmcp::transport::stdio()).await?;
+    let service = IncidentServer::new(guard)
+        .serve(rmcp::transport::stdio())
+        .await?;
     service.waiting().await?;
     Ok(())
 }

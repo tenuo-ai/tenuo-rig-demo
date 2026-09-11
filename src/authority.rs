@@ -64,7 +64,10 @@ pub fn guarded<A, T>(
 where
     A: Serialize,
 {
-    let run = ctx.get::<RunAuthority>().cloned().ok_or(ToolError::NoAuthority)?;
+    let run = ctx
+        .get::<RunAuthority>()
+        .cloned()
+        .ok_or(ToolError::NoAuthority)?;
     let value = serde_json::to_value(args).map_err(|e| ToolError::Arguments(e.to_string()))?;
     let call = Call::try_from_json(capability, &value)
         .map_err(|e| ToolError::Arguments(format!("{e:?}")))?;
@@ -72,11 +75,20 @@ where
     let summary = value.to_string();
     let result = run.guard.guard(&run.authority, &call, op);
     match &result {
-        Ok(_) => println!("      [tenuo] allow  {:<14} {capability} {summary}", run.agent),
+        Ok(_) => println!(
+            "      [tenuo] allow  {:<14} {capability} {summary}",
+            run.agent
+        ),
         Err(GuardError::Denied(d)) => {
-            println!("      [tenuo] deny   {:<14} {capability} {summary}  ({})", run.agent, d.code())
+            println!(
+                "      [tenuo] deny   {:<14} {capability} {summary}  ({})",
+                run.agent,
+                d.code()
+            )
         }
-        Err(GuardError::Operation(e)) => println!("      [tenuo] error  {:<14} {capability}: {e}", run.agent),
+        Err(GuardError::Operation(e)) => {
+            println!("      [tenuo] error  {:<14} {capability}: {e}", run.agent)
+        }
     }
 
     let guarded = result.map_err(|e| match e {

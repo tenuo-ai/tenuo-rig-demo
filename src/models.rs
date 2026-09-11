@@ -9,13 +9,20 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use futures::stream;
-use rig::completion::{CompletionError, CompletionModel, CompletionRequest, CompletionResponse, Usage};
+use rig::completion::{
+    CompletionError, CompletionModel, CompletionRequest, CompletionResponse, Usage,
+};
 use rig::message::{AssistantContent, ToolCall, ToolFunction};
-use rig::streaming::{RawStreamingChoice, RawStreamingToolCall, StreamFinal, StreamingCompletionResponse};
+use rig::streaming::{
+    RawStreamingChoice, RawStreamingToolCall, StreamFinal, StreamingCompletionResponse,
+};
 
 #[derive(Clone)]
 pub enum Step {
-    Call { tool: &'static str, args: serde_json::Value },
+    Call {
+        tool: &'static str,
+        args: serde_json::Value,
+    },
     /// Several tool calls in one turn. Rig runs them concurrently under `tool_concurrency(n)`.
     Calls(Vec<(&'static str, serde_json::Value)>),
     Say(&'static str),
@@ -31,7 +38,11 @@ pub struct ScriptedModel {
 
 impl ScriptedModel {
     pub fn new(name: &'static str, steps: Vec<Step>) -> Self {
-        Self { name, steps: Arc::new(steps), turn: Arc::new(AtomicUsize::new(0)) }
+        Self {
+            name,
+            steps: Arc::new(steps),
+            turn: Arc::new(AtomicUsize::new(0)),
+        }
     }
 
     fn next(&self) -> Step {
@@ -48,30 +59,57 @@ fn tool_call(tool: &'static str, args: serde_json::Value, i: usize) -> Assistant
 }
 
 fn stream_call(tool: &'static str, args: serde_json::Value, i: usize) -> RawStreamingChoice {
-    RawStreamingChoice::ToolCall(RawStreamingToolCall::new(format!("{tool}-call-{i}"), tool.to_owned(), args))
+    RawStreamingChoice::ToolCall(RawStreamingToolCall::new(
+        format!("{tool}-call-{i}"),
+        tool.to_owned(),
+        args,
+    ))
 }
 
 fn usage(total_tokens: u64) -> Usage {
-    Usage { total_tokens, ..Usage::new() }
+    Usage {
+        total_tokens,
+        ..Usage::new()
+    }
 }
 
 impl CompletionModel for ScriptedModel {
-    async fn completion(&self, _request: CompletionRequest) -> Result<CompletionResponse, CompletionError> {
+    async fn completion(
+        &self,
+        _request: CompletionRequest,
+    ) -> Result<CompletionResponse, CompletionError> {
         let choices = match self.next() {
             Step::Call { tool, args } => vec![tool_call(tool, args, 0)],
-            Step::Calls(calls) => calls.into_iter().enumerate().map(|(i, (t, a))| tool_call(t, a, i)).collect(),
+            Step::Calls(calls) => calls
+                .into_iter()
+                .enumerate()
+                .map(|(i, (t, a))| tool_call(t, a, i))
+                .collect(),
             Step::Say(text) => vec![AssistantContent::text(text)],
         };
         Ok(CompletionResponse::new(choices, usage(1), self.name))
     }
 
-    async fn stream(&self, _request: CompletionRequest) -> Result<StreamingCompletionResponse, CompletionError> {
+    async fn stream(
+        &self,
+        _request: CompletionRequest,
+    ) -> Result<StreamingCompletionResponse, CompletionError> {
         let mut items: Vec<Result<RawStreamingChoice, CompletionError>> = match self.next() {
             Step::Call { tool, args } => vec![Ok(stream_call(tool, args, 0))],
-            Step::Calls(calls) => calls.into_iter().enumerate().map(|(i, (t, a))| Ok(stream_call(t, a, i))).collect(),
+            Step::Calls(calls) => calls
+                .into_iter()
+                .enumerate()
+                .map(|(i, (t, a))| Ok(stream_call(t, a, i)))
+                .collect(),
             Step::Say(text) => vec![Ok(RawStreamingChoice::Message(text.to_owned()))],
         };
-        items.push(Ok(RawStreamingChoice::FinalResponse(StreamFinal::new(self.name, usage(1)))));
-        Ok(StreamingCompletionResponse::stream(self.name, Box::pin(stream::iter(items))))
+        items.push(Ok(RawStreamingChoice::FinalResponse(StreamFinal::new(
+            self.name,
+            usage(1),
+        ))));
+        Ok(StreamingCompletionResponse::stream(
+            self.name,
+            Box::pin(stream::iter(items)),
+        ))
     }
 }

@@ -1,0 +1,92 @@
+use std::process::{Command, Output};
+use std::sync::OnceLock;
+
+struct DemoOutput {
+    stdout: String,
+    stderr: String,
+}
+
+fn demo_output() -> &'static DemoOutput {
+    static OUTPUT: OnceLock<DemoOutput> = OnceLock::new();
+    OUTPUT.get_or_init(|| {
+        let output = Command::new(env!("CARGO_BIN_EXE_demo"))
+            .output()
+            .expect("run the scripted demo");
+        assert_success(&output);
+        DemoOutput {
+            stdout: String::from_utf8(output.stdout).expect("demo stdout is UTF-8"),
+            stderr: String::from_utf8(output.stderr).expect("demo stderr is UTF-8"),
+        }
+    })
+}
+
+fn assert_success(output: &Output) {
+    assert!(
+        output.status.success(),
+        "demo failed with {}\nstdout:\n{}\nstderr:\n{}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+}
+
+#[test]
+fn rig_dispatch_enforces_argument_constraints() {
+    let output = demo_output();
+    assert!(output.stdout.contains(
+        "[tenuo] allow  orchestrator   scale_cluster {\"cluster\":\"staging-web\",\"replicas\":3}"
+    ));
+    assert!(output.stdout.contains(
+        "[tenuo] deny   orchestrator   scale_cluster {\"cluster\":\"production-web\",\"replicas\":20}  (constraint-violation)"
+    ));
+}
+
+#[test]
+fn delegated_workers_are_isolated_and_cannot_widen_authority() {
+    let output = demo_output();
+    assert!(output.stdout.contains(
+        "worker[INC-42] read_incident {\"incident_id\":\"INC-43\"}  (constraint-violation)"
+    ));
+    assert!(output.stdout.contains(
+        "worker[INC-43] read_incident {\"incident_id\":\"INC-42\"}  (constraint-violation)"
+    ));
+    assert!(output.stdout.contains("reader[INC-42] holder="));
+    assert!(output.stdout.contains("depth=3 ttl=120s terminal"));
+    assert!(output.stdout.contains("cannot attenuate Exact to Pattern"));
+}
+
+#[test]
+fn mcp_server_verifies_delegated_calls_independently() {
+    let output = demo_output();
+    assert!(output
+        .stderr
+        .contains("[mcp-server] verified read_incident INC-42"));
+    assert!(output
+        .stderr
+        .contains("[mcp-server] verified read_incident INC-43"));
+    assert!(output.stderr.contains("chain depth 2"));
+    assert!(output.stderr.contains("chain depth 3"));
+}
+
+#[test]
+fn mcp_server_rejects_client_bypass_attempts() {
+    let output = demo_output();
+    assert!(output
+        .stderr
+        .contains("[mcp-server] denied   read_incident INC-99"));
+    assert!(output
+        .stdout
+        .contains("server: denied a validly signed call outside the warrant"));
+    assert!(output
+        .stderr
+        .contains("[mcp-server] refused  read_incident INC-42: no _meta.tenuo"));
+    assert!(output
+        .stdout
+        .contains("server: refused a call with no warrant at all"));
+}
+
+#[test]
+fn demo_does_not_emit_duplicate_sdk_denial_lines() {
+    let output = demo_output();
+    assert!(!output.stderr.contains("tenuo deny ["));
+}

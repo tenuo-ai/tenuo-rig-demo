@@ -37,9 +37,16 @@ impl Tool for ScaleCluster {
         })
     }
 
-    async fn call(&self, ctx: &mut ToolContext, args: Self::Args) -> Result<Self::Output, Self::Error> {
+    async fn call(
+        &self,
+        ctx: &mut ToolContext,
+        args: Self::Args,
+    ) -> Result<Self::Output, Self::Error> {
         guarded(ctx, Self::NAME, &args, |_| {
-            Ok(format!("scaled {} to {} replicas", args.cluster, args.replicas))
+            Ok(format!(
+                "scaled {} to {} replicas",
+                args.cluster, args.replicas
+            ))
         })
     }
 }
