@@ -49,7 +49,7 @@ If `LLM_PROVIDER` is omitted, the demo selects OpenAI when `OPENAI_API_KEY` is p
 
 Anthropic organization-level keys may also require `ANTHROPIC_WORKSPACE_ID`; the demo forwards it as the `anthropic-workspace-id` header when set.
 
-Depends on `tenuo` 0.2.4 from crates.io and `rig` 0.42.
+Depends on `tenuo` 0.2.5 from crates.io and `rig` 0.42.
 
 To run the end-to-end security checks:
 
