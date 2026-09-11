@@ -37,19 +37,19 @@ async fn main() -> anyhow::Result<()> {
     let orchestrator_key = SigningKey::generate();
     let warrant = control_plane.mint_orchestrator_warrant(&orchestrator_key.public_key())?;
 
-    let (guard, authority) = Tenuo::local()
+    let runtime = Runtime::builder()
+        .holder(orchestrator_key)
         .trusted_root(root_public_key.clone())
-        .chain(vec![warrant])
-        .signer(orchestrator_key)
         .revocation(RevocationMode::TtlOnly {
             max_lifetime: Duration::from_secs(3600),
         })
         // `guarded()` prints the demo's structured allow/deny transcript.
         .denial_reporting(DenialReporting::Debug)
         .build()?;
+    let session = runtime.session_from_warrant(warrant)?;
     let run = RunAuthority {
-        guard: Arc::new(guard),
-        authority: Arc::new(authority),
+        guard: Arc::new(session.enforcer().clone()),
+        authority: Arc::new(session.authority().clone()),
         agent: "orchestrator".into(),
     };
 

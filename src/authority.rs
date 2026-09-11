@@ -143,6 +143,9 @@ pub fn guarded_value<T>(
         Err(GuardError::Operation(e)) => {
             println!("      [tenuo] error  {:<14} {capability}: {e}", run.agent)
         }
+        Err(other) => {
+            println!("      [tenuo] error  {:<14} {capability}: {other}", run.agent)
+        }
     }
 
     let guarded = result.map_err(|e| match e {
@@ -151,6 +154,7 @@ pub fn guarded_value<T>(
             message: d.message().to_string(),
         },
         GuardError::Operation(e) => e,
+        other => ToolError::Operation(other.to_string()),
     })?;
     ctx.insert_result(guarded.decision.metadata.clone());
     Ok(guarded.into_inner())

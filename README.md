@@ -26,7 +26,7 @@ cargo build --locked --bins && LLM_PROVIDER=openai OPENAI_API_KEY=... cargo run 
 
 If `LLM_PROVIDER` is omitted, the demo selects OpenAI when `OPENAI_API_KEY` is present and otherwise selects Anthropic. Override the defaults with `OPENAI_MODEL` or `ANTHROPIC_MODEL`. Anthropic organization-level keys may also require `ANTHROPIC_WORKSPACE_ID`; the demo forwards it as the `anthropic-workspace-id` header when set.
 
-Depends on `tenuo` 0.2.5 from crates.io and `rig` 0.42.
+Depends on `tenuo` 0.3.0 from crates.io and `rig` 0.42.
 
 ```bash
 cargo test --locked --all-targets

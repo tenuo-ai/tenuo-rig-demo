@@ -6579,9 +6579,9 @@ dependencies = [
 
 [[package]]
 name = "tenuo"
-version = "0.2.5"
+version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "35fe2359b02b018fc1c8d8cd92892c369c2e96fe269557f389ce1eb97ecbe26c"
+checksum = "72d85723b094ec5c24e83981100274acfc34b9fed4caa7f98f7ec39abb10f3e8"
 dependencies = [
  "base64 0.23.1",
  "chrono",
